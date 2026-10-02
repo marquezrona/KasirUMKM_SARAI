@@ -9,8 +9,6 @@ import uuid
 import hmac
 import hashlib
 import logging
-import asyncio
-import json
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
@@ -19,160 +17,14 @@ import jwt
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
+from sqlalchemy.exc import IntegrityError
+from database import Database
 
 # ------------------------------------------------------------
 # Setup
 # ------------------------------------------------------------
-class MemoryCursor:
-    def __init__(self, docs, projection=None):
-        self.docs = list(docs)
-        self.projection = projection or {}
-
-    def sort(self, key, direction=-1):
-        reverse = direction == -1
-        self.docs = sorted(self.docs, key=lambda d: d.get(key, 0), reverse=reverse)
-        return self
-
-    async def to_list(self, limit=None):
-        items = self.docs if limit is None else self.docs[:limit]
-        return [self._project(doc) for doc in items]
-
-    def _project(self, doc):
-        if not self.projection or self.projection == {"_id": 0}:
-            return {k: v for k, v in doc.items() if k != "_id"}
-        res = {}
-        for k, v in self.projection.items():
-            if v == 0:
-                continue
-            if k == "_id":
-                continue
-            if k in doc:
-                res[k] = doc[k]
-        if not res and self.projection:
-            return {k: v for k, v in doc.items() if k != "_id"}
-        return res
-
-
-class MemoryCollection:
-    def __init__(self, name):
-        self.name = name
-        self.data = []
-
-    def _matches(self, doc, query):
-        if not query:
-            return True
-        for key, expected in query.items():
-            value = doc.get(key)
-            if isinstance(expected, dict):
-                for op, op_value in expected.items():
-                    if op == "$gte" and not (value >= op_value):
-                        return False
-                    if op == "$lt" and not (value < op_value):
-                        return False
-                    if op == "$gt" and not (value > op_value):
-                        return False
-                    if op == "$lte" and not (value <= op_value):
-                        return False
-                    if op == "$in" and value not in op_value:
-                        return False
-                    if op == "$ne" and value == op_value:
-                        return False
-                continue
-            if key == "_id":
-                if value != expected:
-                    return False
-                continue
-            if value != expected:
-                return False
-        return True
-
-    async def create_index(self, *args, **kwargs):
-        return None
-
-    async def find_one(self, query=None, projection=None):
-        query = query or {}
-        for doc in self.data:
-            if self._matches(doc, query):
-                return self._project(doc, projection)
-        return None
-
-    def _project(self, doc, projection=None):
-        projection = projection or {}
-        if not projection:
-            return {k: v for k, v in doc.items() if k != "_id"}
-        res = {}
-        for k, v in projection.items():
-            if v == 0:
-                continue
-            if k == "_id":
-                continue
-            if k in doc:
-                res[k] = doc[k]
-        if not res:
-            return {k: v for k, v in doc.items() if k != "_id"}
-        return res
-
-    def find(self, query=None, projection=None):
-        query = query or {}
-        results = [doc for doc in self.data if self._matches(doc, query)]
-        return MemoryCursor(results, projection)
-
-    async def insert_one(self, doc):
-        if "id" not in doc:
-            import uuid
-            doc = {**doc, "id": str(uuid.uuid4())}
-        self.data.append(doc)
-        return type("Result", (), {"inserted_id": doc.get("id")})()
-
-    async def update_one(self, query, update):
-        for doc in self.data:
-            if self._matches(doc, query):
-                for operator, values in update.items():
-                    if operator == "$set":
-                        doc.update(values)
-                    elif operator == "$inc":
-                        for k, v in values.items():
-                            doc[k] = (doc.get(k, 0) or 0) + v
-                return type("Result", (), {"matched_count": 1, "modified_count": 1})()
-        return type("Result", (), {"matched_count": 0, "modified_count": 0})()
-
-    async def delete_one(self, query):
-        for idx, doc in enumerate(self.data):
-            if self._matches(doc, query):
-                del self.data[idx]
-                return type("Result", (), {"deleted_count": 1})()
-        return type("Result", (), {"deleted_count": 0})()
-
-    async def delete_many(self, query):
-        original = len(self.data)
-        self.data = [doc for doc in self.data if not self._matches(doc, query)]
-        return type("Result", (), {"deleted_count": original - len(self.data)})()
-
-    async def count_documents(self, query=None):
-        query = query or {}
-        return sum(1 for doc in self.data if self._matches(doc, query))
-
-
-class MemoryDatabase:
-    def __init__(self):
-        self.users = MemoryCollection("users")
-        self.umkms = MemoryCollection("umkms")
-        self.products = MemoryCollection("products")
-        self.transactions = MemoryCollection("transactions")
-        self.customers = MemoryCollection("customers")
-        self.audit_logs = MemoryCollection("audit_logs")
-        self.settlement_config = MemoryCollection("settlement_config")
-
-
-mongo_url = os.environ['MONGO_URL']
-try:
-    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=2000)
-    db = client[os.environ['DB_NAME']]
-except Exception:
-    client = None
-    db = MemoryDatabase()
+db: Database | None = None
 
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALG = "HS256"
@@ -231,11 +83,11 @@ async def get_current_user(creds: Optional[HTTPAuthorizationCredentials] = Depen
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.PyJWTError:
         raise HTTPException(401, "Invalid token")
-    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+    user = await db.users.get_one({"id": payload["sub"]}, omit={"password_hash"})
     if not user:
         raise HTTPException(401, "User not found")
     if user.get("role") == "umkm":
-        umkm = await db.umkms.find_one({"id": user.get("umkm_id")})
+        umkm = await db.umkms.get_one({"id": user.get("umkm_id")})
         if not umkm or not umkm.get("active", True):
             raise HTTPException(401, "Akun UMKM sedang dinonaktifkan")
     return user
@@ -253,8 +105,15 @@ def require_umkm(user=Depends(get_current_user)):
     return user
 
 
-async def audit(user_id: str, action: str, meta: dict = None, umkm_id: str = None):
-    await db.audit_logs.insert_one({
+async def audit(
+    user_id: str,
+    action: str,
+    meta: dict = None,
+    umkm_id: str = None,
+    database: Database | Any = None,
+):
+    target = database or db
+    await target.audit_logs.insert({
         "id": str(uuid.uuid4()),
         "user_id": user_id,
         "umkm_id": umkm_id,
@@ -392,11 +251,11 @@ ws_manager = WSManager()
 @api.post("/auth/login")
 async def login(body: LoginIn):
     email = body.email.lower()
-    user = await db.users.find_one({"email": email})
+    user = await db.users.get_one({"email": email})
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(401, "Email atau password salah")
     if user.get("role") == "umkm":
-        umkm = await db.umkms.find_one({"id": user.get("umkm_id")})
+        umkm = await db.umkms.get_one({"id": user.get("umkm_id")})
         if not umkm or not umkm.get("active", True):
             raise HTTPException(401, "Akun UMKM sedang dinonaktifkan")
     token = create_token(user["id"], user["role"], user.get("umkm_id"))
@@ -421,14 +280,14 @@ async def logout(user=Depends(get_current_user)):
 
 @api.put("/admin/account")
 async def update_admin_account(body: AdminAccountUpdateIn, user=Depends(require_admin)):
-    admin = await db.users.find_one({"id": user["id"]})
+    admin = await db.users.get_one({"id": user["id"]})
     if not admin or not verify_password(body.current_password, admin["password_hash"]):
         raise HTTPException(401, "Password saat ini salah")
     email = body.email.lower()
-    existing = await db.users.find_one({"email": email})
+    existing = await db.users.get_one({"email": email})
     if existing and existing.get("id") != user["id"]:
         raise HTTPException(400, "Email sudah digunakan akun lain")
-    await db.users.update_one({"id": user["id"]}, {"$set": {"email": email}})
+    await db.users.update({"id": user["id"]}, {"email": email})
     await audit(user["id"], "admin_email_updated", {"email": email})
     return {"email": email}
 
@@ -444,24 +303,24 @@ async def me(user=Depends(get_current_user)):
 @api.get("/admin/dashboard")
 async def admin_dashboard(user=Depends(require_admin)):
     today = datetime.now(timezone.utc).date().isoformat()
-    umkms = await db.umkms.find({}, {"_id": 0}).to_list(1000)
+    umkms = await db.umkms.get_many(limit=1000)
     active_umkms = [u for u in umkms if u.get("active", True)]
-    txns_today = await db.transactions.find(
-        {"created_at": {"$gte": today}}, {"_id": 0}
-    ).to_list(10000)
+    txns_today = await db.transactions.get_many({"created_at__gte": today}, limit=10000)
     total_today = sum(t["total"] for t in txns_today)
     by_method = {"NFC": 0, "QRIS": 0}
     for t in txns_today:
         by_method[t["payment_method"]] = by_method.get(t["payment_method"], 0) + 1
-    offline_count = await db.transactions.count_documents({"offline": True})
-    pending_sync = await db.transactions.count_documents({"sync_status": "PENDING"})
+    offline_count = await db.transactions.count({"offline": True})
+    pending_sync = await db.transactions.count({"sync_status": "PENDING"})
     total_balance = sum(u.get("balance", 0) for u in umkms)
 
     # daily series last 7 days
     series = []
     for i in range(6, -1, -1):
         d = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
-        txs = await db.transactions.find({"created_at": {"$gte": d, "$lt": d + "T99"}}, {"_id": 0}).to_list(10000)
+        txs = await db.transactions.get_many(
+            {"created_at__gte": d, "created_at__lt": d + "T99"}, limit=10000
+        )
         series.append({"date": d, "total": sum(t["total"] for t in txs), "count": len(txs)})
 
     # top umkms
@@ -475,7 +334,7 @@ async def admin_dashboard(user=Depends(require_admin)):
         if u:
             top_list.append({"umkm_id": uid, "store_name": u["store_name"], "total": total})
 
-    recent = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(10)
+    recent = await db.transactions.get_many(order_by=("created_at", "desc"), limit=10)
 
     return {
         "total_umkms": len(umkms),
@@ -497,7 +356,7 @@ async def admin_dashboard(user=Depends(require_admin)):
 
 @api.get("/admin/umkms")
 async def list_umkms(user=Depends(require_admin)):
-    return await db.umkms.find({}, {"_id": 0}).to_list(1000)
+    return await db.umkms.get_many(limit=1000)
 
 
 @api.get("/admin/products")
@@ -505,8 +364,8 @@ async def admin_products(status: Optional[str] = None, user=Depends(require_admi
     query = {}
     if status in {"PENDING", "APPROVED", "REJECTED"}:
         query["approval_status"] = status
-    products = await db.products.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
-    umkms = await db.umkms.find({}, {"_id": 0}).to_list(1000)
+    products = await db.products.get_many(query, order_by=("created_at", "desc"), limit=5000)
+    umkms = await db.umkms.get_many(limit=1000)
     stores = {u["id"]: u for u in umkms}
     for product in products:
         store = stores.get(product.get("umkm_id"), {})
@@ -516,10 +375,12 @@ async def admin_products(status: Optional[str] = None, user=Depends(require_admi
 
 @api.get("/admin/umkms/{umkm_id}/products")
 async def admin_umkm_products(umkm_id: str, user=Depends(require_admin)):
-    umkm = await db.umkms.find_one({"id": umkm_id}, {"_id": 0})
+    umkm = await db.umkms.get_one({"id": umkm_id})
     if not umkm:
         raise HTTPException(404, "UMKM tidak ditemukan")
-    products = await db.products.find({"umkm_id": umkm_id}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    products = await db.products.get_many(
+        {"umkm_id": umkm_id}, order_by=("created_at", "desc"), limit=5000
+    )
     return {"umkm": umkm, "products": products}
 
 
@@ -527,17 +388,17 @@ async def admin_umkm_products(umkm_id: str, user=Depends(require_admin)):
 async def decide_product(pid: str, body: ProductDecisionIn, user=Depends(require_admin)):
     if body.status not in {"APPROVED", "REJECTED"}:
         raise HTTPException(400, "Status persetujuan tidak valid")
-    product = await db.products.find_one({"id": pid}, {"_id": 0})
+    product = await db.products.get_one({"id": pid})
     if not product:
         raise HTTPException(404, "Produk tidak ditemukan")
-    await db.products.update_one(
+    await db.products.update(
         {"id": pid},
-        {"$set": {
+        {
             "approval_status": body.status,
             "approval_note": body.approval_note or "",
             "approved_at": now_iso(),
             "approved_by": user["id"],
-        }},
+        },
     )
     await audit(user["id"], "product_approval", {
         "product_id": pid,
@@ -549,12 +410,12 @@ async def decide_product(pid: str, body: ProductDecisionIn, user=Depends(require
 
 @api.post("/admin/umkms")
 async def create_umkm(body: UmkmCreateIn, user=Depends(require_admin)):
-    existing = await db.users.find_one({"email": body.email.lower()})
+    existing = await db.users.get_one({"email": body.email.lower()})
     if existing:
         raise HTTPException(400, "Email sudah terdaftar")
     umkm_id = str(uuid.uuid4())
     user_id = str(uuid.uuid4())
-    await db.umkms.insert_one({
+    await db.umkms.insert({
         "id": umkm_id,
         "store_name": body.store_name,
         "address": body.address,
@@ -565,7 +426,7 @@ async def create_umkm(body: UmkmCreateIn, user=Depends(require_admin)):
         "active": True,
         "created_at": now_iso(),
     })
-    await db.users.insert_one({
+    await db.users.insert({
         "id": user_id,
         "email": body.email.lower(),
         "password_hash": hash_password(body.password),
@@ -580,44 +441,43 @@ async def create_umkm(body: UmkmCreateIn, user=Depends(require_admin)):
 
 @api.patch("/admin/umkms/{umkm_id}/toggle")
 async def toggle_umkm(umkm_id: str, user=Depends(require_admin)):
-    u = await db.umkms.find_one({"id": umkm_id})
+    u = await db.umkms.get_one({"id": umkm_id})
     if not u:
         raise HTTPException(404, "UMKM tidak ditemukan")
     new_state = not u.get("active", True)
-    await db.umkms.update_one({"id": umkm_id}, {"$set": {"active": new_state}})
+    await db.umkms.update({"id": umkm_id}, {"active": new_state})
     await audit(user["id"], "umkm_toggle", {"umkm_id": umkm_id, "active": new_state})
     return {"ok": True, "active": new_state}
 
 
 @api.delete("/admin/umkms/{umkm_id}")
 async def delete_umkm(umkm_id: str, user=Depends(require_admin)):
-    umkm = await db.umkms.find_one({"id": umkm_id})
+    umkm = await db.umkms.get_one({"id": umkm_id})
     if not umkm:
         raise HTTPException(404, "UMKM tidak ditemukan")
-    await db.users.delete_one({"id": umkm.get("owner_user_id")})
-    await db.umkms.delete_one({"id": umkm_id})
-    await db.products.delete_many({"umkm_id": umkm_id})
-    await db.customers.delete_many({"umkm_id": umkm_id})
-    await db.transactions.delete_many({"umkm_id": umkm_id})
+    async with db.transaction() as tx:
+        await tx.users.delete_one({"id": umkm.get("owner_user_id")})
+        await tx.products.delete_many({"umkm_id": umkm_id})
+        await tx.customers.delete_many({"umkm_id": umkm_id})
+        await tx.transactions.delete_many({"umkm_id": umkm_id})
+        await tx.umkms.delete_one({"id": umkm_id})
     await audit(user["id"], "umkm_deleted", {"umkm_id": umkm_id, "store_name": umkm.get("store_name")})
     return {"ok": True}
 
 
 @api.get("/admin/transactions")
 async def admin_transactions(limit: int = 200, user=Depends(require_admin)):
-    txns = await db.transactions.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    txns = await db.transactions.get_many(order_by=("created_at", "desc"), limit=limit)
     return txns
 
 
 @api.get("/admin/settlement")
 async def get_settlement(user=Depends(require_admin)):
-    cfg = await db.settlement_config.find_one({"id": "default"}, {"_id": 0})
+    cfg = await db.settlement_config.get_one({"id": "default"})
     if not cfg:
         cfg = {"id": "default", "umkm_pct": 90, "pemkab_pct": 8, "admin_pct": 2}
-        await db.settlement_config.insert_one(cfg)
-    paid_transactions = await db.transactions.find(
-        {"status": "PAID"}, {"_id": 0, "total": 1}
-    ).to_list(10000)
+        await db.settlement_config.insert(cfg)
+    paid_transactions = await db.transactions.get_many({"status": "PAID"}, columns=["total"], limit=10000)
     total_in = sum(t.get("total", 0) for t in paid_transactions)
     return {
         "config": {"umkm_pct": cfg["umkm_pct"], "pemkab_pct": cfg["pemkab_pct"], "admin_pct": cfg["admin_pct"]},
@@ -632,9 +492,9 @@ async def get_settlement(user=Depends(require_admin)):
 async def update_settlement(body: SettlementConfigIn, user=Depends(require_admin)):
     if abs(body.umkm_pct + body.pemkab_pct + body.admin_pct - 100) > 0.01:
         raise HTTPException(400, "Total persentase harus 100")
-    await db.settlement_config.update_one(
+    await db.settlement_config.update(
         {"id": "default"},
-        {"$set": {"umkm_pct": body.umkm_pct, "pemkab_pct": body.pemkab_pct, "admin_pct": body.admin_pct}},
+        {"umkm_pct": body.umkm_pct, "pemkab_pct": body.pemkab_pct, "admin_pct": body.admin_pct},
         upsert=True,
     )
     await audit(user["id"], "settlement_update", body.dict())
@@ -643,7 +503,7 @@ async def update_settlement(body: SettlementConfigIn, user=Depends(require_admin
 
 @api.get("/admin/audit-logs")
 async def audit_logs(user=Depends(require_admin)):
-    logs = await db.audit_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    logs = await db.audit_logs.get_many(order_by=("created_at", "desc"), limit=500)
     return logs
 
 
@@ -653,11 +513,11 @@ async def audit_logs(user=Depends(require_admin)):
 @api.get("/umkm/dashboard")
 async def umkm_dashboard(user=Depends(require_umkm)):
     umkm_id = user["umkm_id"]
-    umkm = await db.umkms.find_one({"id": umkm_id}, {"_id": 0})
+    umkm = await db.umkms.get_one({"id": umkm_id})
     today = datetime.now(timezone.utc).date().isoformat()
-    txns_today = await db.transactions.find(
-        {"umkm_id": umkm_id, "created_at": {"$gte": today}}, {"_id": 0}
-    ).to_list(10000)
+    txns_today = await db.transactions.get_many(
+        {"umkm_id": umkm_id, "created_at__gte": today}, limit=10000
+    )
     total_today = sum(t["total"] for t in txns_today)
     by_method = {"NFC": 0, "QRIS": 0}
     for t in txns_today:
@@ -674,13 +534,14 @@ async def umkm_dashboard(user=Depends(require_umkm)):
     series = []
     for i in range(6, -1, -1):
         d = (datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat()
-        txs = await db.transactions.find(
-            {"umkm_id": umkm_id, "created_at": {"$gte": d, "$lt": d + "T99"}}, {"_id": 0}
-        ).to_list(10000)
+        txs = await db.transactions.get_many(
+            {"umkm_id": umkm_id, "created_at__gte": d, "created_at__lt": d + "T99"},
+            limit=10000,
+        )
         series.append({"date": d, "total": sum(t["total"] for t in txs)})
 
-    offline_count = await db.transactions.count_documents({"umkm_id": umkm_id, "offline": True})
-    pending_sync = await db.transactions.count_documents({"umkm_id": umkm_id, "sync_status": "PENDING"})
+    offline_count = await db.transactions.count({"umkm_id": umkm_id, "offline": True})
+    pending_sync = await db.transactions.count({"umkm_id": umkm_id, "sync_status": "PENDING"})
 
     return {
         "store_name": umkm["store_name"] if umkm else "",
@@ -698,7 +559,9 @@ async def umkm_dashboard(user=Depends(require_umkm)):
 
 @api.get("/umkm/products")
 async def list_products(approved_only: bool = False, user=Depends(require_umkm)):
-    products = await db.products.find({"umkm_id": user["umkm_id"]}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    products = await db.products.get_many(
+        {"umkm_id": user["umkm_id"]}, order_by=("created_at", "desc"), limit=1000
+    )
     for product in products:
         product.setdefault("approval_status", "APPROVED")
     if approved_only:
@@ -716,17 +579,17 @@ async def create_product(body: ProductIn, user=Depends(require_umkm)):
         "approval_note": "",
         "created_at": now_iso(),
     }
-    await db.products.insert_one(p)
+    await db.products.insert(p)
     await audit(user["id"], "product_create_pending", {"product_id": p["id"], "name": p["name"]}, user["umkm_id"])
     return p
 
 
 @api.put("/umkm/products/{pid}")
 async def update_product(pid: str, body: ProductIn, user=Depends(require_umkm)):
-    r = await db.products.update_one(
-        {"id": pid, "umkm_id": user["umkm_id"]}, {"$set": body.dict()}
+    updated = await db.products.update(
+        {"id": pid, "umkm_id": user["umkm_id"]}, body.dict()
     )
-    if r.matched_count == 0:
+    if not updated:
         raise HTTPException(404, "Produk tidak ditemukan")
     await audit(user["id"], "product_update", {"product_id": pid}, user["umkm_id"])
     return {"ok": True}
@@ -734,8 +597,8 @@ async def update_product(pid: str, body: ProductIn, user=Depends(require_umkm)):
 
 @api.delete("/umkm/products/{pid}")
 async def delete_product(pid: str, user=Depends(require_umkm)):
-    r = await db.products.delete_one({"id": pid, "umkm_id": user["umkm_id"]})
-    if r.deleted_count == 0:
+    deleted = await db.products.delete_one({"id": pid, "umkm_id": user["umkm_id"]})
+    if not deleted:
         raise HTTPException(404, "Produk tidak ditemukan")
     await audit(user["id"], "product_delete", {"product_id": pid}, user["umkm_id"])
     return {"ok": True}
@@ -743,7 +606,7 @@ async def delete_product(pid: str, user=Depends(require_umkm)):
 
 @api.get("/umkm/customers")
 async def list_customers(user=Depends(require_umkm)):
-    cs = await db.customers.find({"umkm_id": user["umkm_id"]}, {"_id": 0}).to_list(1000)
+    cs = await db.customers.get_many({"umkm_id": user["umkm_id"]}, limit=1000)
     # add masked card
     for c in cs:
         if c.get("nfc_card_id"):
@@ -755,15 +618,15 @@ async def list_customers(user=Depends(require_umkm)):
 @api.post("/umkm/customers")
 async def create_customer(body: CustomerIn, user=Depends(require_umkm)):
     c = {"id": str(uuid.uuid4()), "umkm_id": user["umkm_id"], **body.dict(), "created_at": now_iso()}
-    await db.customers.insert_one(c)
+    await db.customers.insert(c)
     await audit(user["id"], "customer_create", {"customer_id": c["id"]}, user["umkm_id"])
     return c
 
 
 @api.put("/umkm/customers/{cid}")
 async def update_customer(cid: str, body: CustomerIn, user=Depends(require_umkm)):
-    r = await db.customers.update_one({"id": cid, "umkm_id": user["umkm_id"]}, {"$set": body.dict()})
-    if r.matched_count == 0:
+    updated = await db.customers.update({"id": cid, "umkm_id": user["umkm_id"]}, body.dict())
+    if not updated:
         raise HTTPException(404, "Pelanggan tidak ditemukan")
     return {"ok": True}
 
@@ -776,10 +639,10 @@ async def delete_customer(cid: str, user=Depends(require_umkm)):
 
 @api.get("/umkm/customers/by-card/{card_id}")
 async def customer_by_card(card_id: str, user=Depends(require_umkm)):
-    c = await db.customers.find_one({"umkm_id": user["umkm_id"], "nfc_card_id": card_id}, {"_id": 0})
+    c = await db.customers.get_one({"umkm_id": user["umkm_id"], "nfc_card_id": card_id})
     if not c:
         # global fallback for demo cards
-        c = await db.customers.find_one({"nfc_card_id": card_id}, {"_id": 0})
+        c = await db.customers.get_one({"nfc_card_id": card_id})
     if not c:
         raise HTTPException(404, "Kartu tidak dikenal")
     c["nfc_card_masked"] = "****" + card_id[-4:]
@@ -788,7 +651,9 @@ async def customer_by_card(card_id: str, user=Depends(require_umkm)):
 
 @api.get("/umkm/transactions")
 async def list_transactions(limit: int = 200, user=Depends(require_umkm)):
-    return await db.transactions.find({"umkm_id": user["umkm_id"]}, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    return await db.transactions.get_many(
+        {"umkm_id": user["umkm_id"]}, order_by=("created_at", "desc"), limit=limit
+    )
 
 
 @api.post("/umkm/transactions")
@@ -796,7 +661,9 @@ async def create_transaction(body: TransactionIn, user=Depends(require_umkm)):
     umkm_id = user["umkm_id"]
 
     # Idempotency check
-    existing = await db.transactions.find_one({"client_txn_id": body.client_txn_id, "umkm_id": umkm_id}, {"_id": 0})
+    existing = await db.transactions.get_one(
+        {"client_txn_id": body.client_txn_id, "umkm_id": umkm_id}
+    )
     if existing:
         return {"ok": True, "transaction": existing, "duplicate": True}
 
@@ -807,26 +674,16 @@ async def create_transaction(body: TransactionIn, user=Depends(require_umkm)):
 
     # Anti-replay: same card, same amount, within 20 seconds
     if body.nfc_card_id:
-        recent_dup = await db.transactions.find_one({
+        recent_dup = await db.transactions.get_one({
             "umkm_id": umkm_id,
             "nfc_card_id": body.nfc_card_id,
             "total": body.total,
-            "created_at": {"$gte": (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()},
+            "created_at__gte": (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat(),
         })
         if recent_dup:
             raise HTTPException(409, "Potential Duplicate Transaction terdeteksi")
 
     # NFC balance deduct
-    if body.payment_method == "NFC" and body.nfc_card_id:
-        customer = await db.customers.find_one({"nfc_card_id": body.nfc_card_id})
-        if not customer:
-            raise HTTPException(400, "Kartu NFC tidak dikenal")
-        if customer.get("balance", 0) < body.total:
-            raise HTTPException(400, "Saldo kartu tidak cukup")
-        await db.customers.update_one(
-            {"id": customer["id"]}, {"$inc": {"balance": -body.total}}
-        )
-
     txn_id = f"TRX-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
     doc = {
         "id": txn_id,
@@ -849,24 +706,59 @@ async def create_transaction(body: TransactionIn, user=Depends(require_umkm)):
         "created_at": body.created_at_client or now_iso(),
         "synced_at": now_iso(),
     }
-    await db.transactions.insert_one(doc)
+    try:
+        async with db.transaction() as tx:
+            duplicate = await tx.transactions.get_one(
+                {"client_txn_id": body.client_txn_id, "umkm_id": umkm_id}
+            )
+            if duplicate:
+                return {"ok": True, "transaction": duplicate, "duplicate": True}
 
-    # Update stock
-    for it in body.items:
-        await db.products.update_one(
-            {"id": it.product_id, "umkm_id": umkm_id}, {"$inc": {"stock": -it.qty}}
-        )
+            if body.payment_method == "NFC" and body.nfc_card_id:
+                customer = await tx.customers.get_one({"nfc_card_id": body.nfc_card_id})
+                if not customer:
+                    raise HTTPException(400, "Kartu NFC tidak dikenal")
+                if customer.get("balance", 0) < body.total:
+                    raise HTTPException(400, "Saldo kartu tidak cukup")
+                deducted = await tx.customers.update(
+                    {"id": customer["id"], "balance__gte": body.total},
+                    increments={"balance": -body.total},
+                )
+                if not deducted:
+                    raise HTTPException(400, "Saldo kartu tidak cukup")
 
-    # Update UMKM balance
-    await db.umkms.update_one({"id": umkm_id}, {"$inc": {"balance": body.total}})
+            await tx.transactions.insert(doc)
+            for item in body.items:
+                updated_stock = await tx.products.update(
+                    {"id": item.product_id, "umkm_id": umkm_id, "stock__gte": item.qty},
+                    increments={"stock": -item.qty},
+                )
+                if not updated_stock:
+                    raise HTTPException(409, "Stok produk tidak cukup atau produk tidak ditemukan")
 
-    await audit(user["id"], "transaction_created",
+            updated_umkm = await tx.umkms.update(
+                {"id": umkm_id}, increments={"balance": body.total}
+            )
+            if not updated_umkm:
+                raise HTTPException(404, "UMKM tidak ditemukan")
+            await audit(
+                user["id"],
+                "transaction_created",
                 {"txn_id": txn_id, "total": body.total, "method": body.payment_method, "offline": body.offline},
-                umkm_id)
+                umkm_id,
+                database=tx,
+            )
+    except IntegrityError:
+        duplicate = await db.transactions.get_one(
+            {"client_txn_id": body.client_txn_id, "umkm_id": umkm_id}
+        )
+        if duplicate:
+            return {"ok": True, "transaction": duplicate, "duplicate": True}
+        raise
 
     # Broadcast via WS
     doc_out = {k: v for k, v in doc.items() if k != "_id"}
-    umkm = await db.umkms.find_one({"id": umkm_id}, {"_id": 0})
+    umkm = await db.umkms.get_one({"id": umkm_id})
     doc_out["store_name"] = umkm["store_name"] if umkm else ""
     await ws_manager.broadcast(umkm_id, {"type": "transaction", "data": doc_out})
 
@@ -883,9 +775,9 @@ async def umkm_reports(period: str = "daily", user=Depends(require_umkm)):
         start = (now - timedelta(days=7)).date().isoformat()
     else:
         start = (now - timedelta(days=30)).date().isoformat()
-    txns = await db.transactions.find(
-        {"umkm_id": umkm_id, "created_at": {"$gte": start}}, {"_id": 0}
-    ).to_list(10000)
+    txns = await db.transactions.get_many(
+        {"umkm_id": umkm_id, "created_at__gte": start}, limit=10000
+    )
     by_product = {}
     by_method = {"NFC": 0, "QRIS": 0}
     for t in txns:
@@ -907,13 +799,13 @@ async def umkm_reports(period: str = "daily", user=Depends(require_umkm)):
 
 @api.get("/umkm/settings")
 async def get_settings(user=Depends(require_umkm)):
-    u = await db.umkms.find_one({"id": user["umkm_id"]}, {"_id": 0})
+    u = await db.umkms.get_one({"id": user["umkm_id"]})
     return u
 
 
 @api.put("/umkm/settings")
 async def update_settings(body: StoreSettingsIn, user=Depends(require_umkm)):
-    await db.umkms.update_one({"id": user["umkm_id"]}, {"$set": body.dict()})
+    await db.umkms.update({"id": user["umkm_id"]}, body.dict())
     await audit(user["id"], "settings_update", body.dict(), user["umkm_id"])
     return {"ok": True}
 
@@ -997,31 +889,24 @@ DEMO_CUSTOMERS = [
 
 @app.on_event("startup")
 async def startup():
-    global client, db
+    global db
     try:
-        if client is not None:
-            await client.admin.command("ping")
-        else:
-            raise RuntimeError("Mongo not configured")
-    except Exception:
-        log.warning("MongoDB unavailable, using in-memory fallback store for demo mode.")
-        client = None
-        db = MemoryDatabase()
-
-    # indexes
-    await db.users.create_index("email", unique=True)
-    await db.umkms.create_index("id")
-    await db.products.create_index([("umkm_id", 1)])
-    await db.transactions.create_index([("umkm_id", 1), ("created_at", -1)])
-    await db.transactions.create_index([("client_txn_id", 1), ("umkm_id", 1)], unique=True)
-    await db.customers.create_index([("nfc_card_id", 1)])
+        db = Database.from_environment()
+        await db.check_connection()
+        await db.create_schema()
+    except Exception as exc:
+        if db is not None:
+            await db.dispose()
+        db = None
+        log.error("MySQL connection or schema initialization failed: %s", exc)
+        raise RuntimeError("MySQL connection or schema initialization failed") from exc
 
     # seed admin
     admin_email = os.environ["ADMIN_EMAIL"].lower()
     admin_pass = os.environ["ADMIN_PASSWORD"]
-    existing_admin = await db.users.find_one({"email": admin_email})
+    existing_admin = await db.users.get_one({"email": admin_email})
     if not existing_admin:
-        await db.users.insert_one({
+        await db.users.insert({
             "id": str(uuid.uuid4()),
             "email": admin_email,
             "password_hash": hash_password(admin_pass),
@@ -1033,17 +918,19 @@ async def startup():
         log.info(f"Seeded admin: {admin_email}")
     else:
         # keep in sync
-        await db.users.update_one({"email": admin_email},
-                                  {"$set": {"password_hash": hash_password(admin_pass), "role": "admin"}})
+        await db.users.update(
+            {"email": admin_email},
+            {"password_hash": hash_password(admin_pass), "role": "admin"},
+        )
 
     # seed UMKMs
     for demo in DEMO_UMKMS:
-        u = await db.users.find_one({"email": demo["email"]})
+        u = await db.users.get_one({"email": demo["email"]})
         if u:
             continue
         umkm_id = str(uuid.uuid4())
         user_id = str(uuid.uuid4())
-        await db.umkms.insert_one({
+        await db.umkms.insert({
             "id": umkm_id,
             "store_name": demo["store_name"],
             "address": demo["address"],
@@ -1054,7 +941,7 @@ async def startup():
             "active": True,
             "created_at": now_iso(),
         })
-        await db.users.insert_one({
+        await db.users.insert({
             "id": user_id,
             "email": demo["email"],
             "password_hash": hash_password("umkm123"),
@@ -1065,7 +952,7 @@ async def startup():
         })
         # products
         for p in DEMO_PRODUCTS.get(demo["store_name"], []):
-            await db.products.insert_one({
+            await db.products.insert({
                 "id": str(uuid.uuid4()),
                 "umkm_id": umkm_id,
                 "name": p["name"],
@@ -1078,7 +965,7 @@ async def startup():
             })
         # customers (per UMKM copies of demo cards for isolation, but also global lookup)
         for c in DEMO_CUSTOMERS:
-            await db.customers.insert_one({
+            await db.customers.insert({
                 "id": str(uuid.uuid4()),
                 "umkm_id": umkm_id,
                 "name": c["name"],
@@ -1090,15 +977,15 @@ async def startup():
         log.info(f"Seeded UMKM: {demo['store_name']}")
 
     # settlement config default
-    cfg = await db.settlement_config.find_one({"id": "default"})
+    cfg = await db.settlement_config.get_one({"id": "default"})
     if not cfg:
-        await db.settlement_config.insert_one({"id": "default", "umkm_pct": 90, "pemkab_pct": 8, "admin_pct": 2})
+        await db.settlement_config.insert({"id": "default", "umkm_pct": 90, "pemkab_pct": 8, "admin_pct": 2})
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    if client is not None:
-        client.close()
+    if db is not None:
+        await db.dispose()
 
 
 app.include_router(api)
