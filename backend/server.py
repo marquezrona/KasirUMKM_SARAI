@@ -26,9 +26,12 @@ from database import Database
 # ------------------------------------------------------------
 db: Database | None = None
 
-JWT_SECRET = os.environ['JWT_SECRET']
+JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALG = "HS256"
-HMAC_SECRET = os.environ['HMAC_SECRET'].encode('utf-8')
+HMAC_SECRET = (os.environ.get("HMAC_SECRET") or "").encode("utf-8")
+
+if not JWT_SECRET or not HMAC_SECRET:
+    raise RuntimeError("Missing JWT_SECRET or HMAC_SECRET in backend/.env")
 
 app = FastAPI(title="Kasir UMKM Sabu Raijua API")
 api = APIRouter(prefix="/api")

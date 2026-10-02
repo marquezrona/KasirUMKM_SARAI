@@ -1,7 +1,13 @@
 import os
 from contextlib import asynccontextmanager
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+ROOT_DIR = Path(__file__).resolve().parent
+load_dotenv(ROOT_DIR / ".env")
 
 from sqlalchemy import (
     Boolean,
