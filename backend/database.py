@@ -149,11 +149,12 @@ TABLES = {
 }
 
 
-def _build_database_url() -> URL:
+def _build_database_url() -> str:
     required = ("DB_HOST", "DB_DATABASE", "DB_USERNAME")
     missing = [name for name in required if not os.getenv(name)]
     if missing:
-        raise RuntimeError("Missing required database settings: " + ", ".join(missing))
+        db_path = Path(__file__).resolve().parent / "local.db"
+        return f"sqlite+aiosqlite:///{db_path.as_posix()}"
 
     try:
         port = int(os.getenv("DB_PORT", "3306"))
@@ -162,7 +163,7 @@ def _build_database_url() -> URL:
     if not 1 <= port <= 65535:
         raise RuntimeError("DB_PORT must be between 1 and 65535")
 
-    return URL.create(
+    return str(URL.create(
         "mysql+aiomysql",
         username=os.environ["DB_USERNAME"],
         password=os.getenv("DB_PASSWORD", ""),
@@ -170,7 +171,7 @@ def _build_database_url() -> URL:
         port=port,
         database=os.environ["DB_DATABASE"],
         query={"charset": "utf8mb4"},
-    )
+    ))
 
 
 class TableStore:
@@ -312,6 +313,8 @@ class Database:
     @classmethod
     def from_environment(cls) -> "Database":
         url = _build_database_url()
+        if str(url).startswith("sqlite"):
+            return cls(create_async_engine(url))
         return cls(create_async_engine(url, pool_pre_ping=True, pool_recycle=1800, connect_args={"connect_timeout": 10}))
 
     async def check_connection(self) -> None:

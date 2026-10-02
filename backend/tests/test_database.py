@@ -57,6 +57,21 @@ class MySQLDdlTests(unittest.TestCase):
         self.assertEqual(len(compiled), 7)
         self.assertTrue(all("CREATE TABLE" in statement for statement in compiled))
 
+    def test_database_from_environment_falls_back_to_sqlite(self):
+        original = {name: os.environ.get(name) for name in ("DB_HOST", "DB_DATABASE", "DB_USERNAME", "DB_PORT")}
+        try:
+            for name in ("DB_HOST", "DB_DATABASE", "DB_USERNAME", "DB_PORT"):
+                os.environ.pop(name, None)
+            db = Database.from_environment()
+            self.assertTrue(str(db.engine.url).startswith("sqlite+aiosqlite"))
+            self.addCleanup(lambda: db.dispose())
+        finally:
+            for name, value in original.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
 
 if __name__ == "__main__":
     unittest.main()
