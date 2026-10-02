@@ -20,7 +20,7 @@ export default function Receipt({ txn, onNew }) {
         <div className="text-center border-b border-dashed border-[#E5DEC9] pb-4">
           <CheckCircle2 className="w-12 h-12 text-emerald-500 mx-auto mb-2" />
           <div className="font-display text-lg font-extrabold text-[#0C2340]">Pembayaran Berhasil</div>
-          <div className="text-xs text-slate-500 mt-1">KASIR UMKM SABU RAIJUA</div>
+          <div className="text-xs text-slate-500 mt-1">HAWUPAY</div>
         </div>
 
         <div className="py-4 text-sm space-y-1">

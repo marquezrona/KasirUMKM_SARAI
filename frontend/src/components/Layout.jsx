@@ -82,7 +82,7 @@ export default function Layout() {
             {storeLogo ? <img src={storeLogo} alt="Logo toko" className="h-full w-full object-cover" /> : <Store className="w-5 h-5 text-[#E6A100]" />}
           </div>
           <div>
-            <div className="font-display font-bold text-[#0C2340] leading-tight">Kasir UMKM</div>
+            <div className="font-display font-bold text-[#0C2340] leading-tight">HawuPay</div>
             <div className="text-[10px] font-semibold uppercase tracking-widest text-[#A63A2B]">Sabu Raijua</div>
           </div>
         </div>

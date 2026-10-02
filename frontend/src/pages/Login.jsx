@@ -39,8 +39,7 @@ export default function Login() {
             <Store className="w-8 h-8 text-[#0C2340]" />
           </div>
           <h1 className="font-display text-4xl md:text-5xl font-extrabold leading-[1.05] mb-4">
-            Kasir UMKM<br />
-            <span className="text-[#E6A100]">Sabu Raijua</span>
+            Hawu<span className="text-[#E6A100]">Pay</span>
           </h1>
           <p className="text-white/80 mb-8">
             Sistem kasir digital untuk UMKM Kabupaten Sabu Raijua. Pembayaran NFC & QRIS, offline-first, siap dipakai di lapangan.
