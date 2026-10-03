@@ -8,12 +8,21 @@ import os
 import uuid
 import hmac
 import hashlib
+import asyncio
+import secrets
+import smtplib
+import ssl
 import logging
+from email.message import EmailMessage
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
 import bcrypt
 import jwt
+import google.auth
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
@@ -55,6 +64,24 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def calculate_settlement_shares(total: float, config: dict) -> dict[str, Decimal]:
+    total_amount = Decimal(str(total)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    umkm_pct = Decimal(str(config["umkm_pct"]))
+    pemkab_pct = Decimal(str(config["pemkab_pct"]))
+    admin_pct = Decimal(str(config["admin_pct"]))
+    umkm_amount = (total_amount * umkm_pct / Decimal("100")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    pemkab_amount = (total_amount * pemkab_pct / Decimal("100")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return {
+        "UMKM": umkm_amount,
+        "PEMDA": pemkab_amount,
+        "ADMIN": total_amount - umkm_amount - pemkab_amount,
+    }
+
+
 def hash_password(p: str) -> str:
     return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
 
@@ -76,8 +103,75 @@ def create_token(user_id: str, role: str, umkm_id: Optional[str] = None) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
+def verify_google_id_token(credential: str, client_id: str) -> dict:
+    return google_id_token.verify_oauth2_token(
+        credential,
+        google_requests.Request(),
+        client_id,
+    )
+
+
 def sign_transaction(payload: str) -> str:
     return hmac.new(HMAC_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _password_reset_digest(purpose: str, value: str) -> str:
+    message = f"password-reset:{purpose}:{value}".encode("utf-8")
+    return hmac.new(HMAC_SECRET, message, hashlib.sha256).hexdigest()
+
+
+def _validate_email_settings() -> None:
+    if not os.getenv("SMTP_HOST") or not (os.getenv("SMTP_FROM") or os.getenv("SMTP_USERNAME")):
+        raise RuntimeError("SMTP_HOST dan SMTP_FROM (atau SMTP_USERNAME) harus dikonfigurasi")
+    try:
+        port = int(os.getenv("SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise RuntimeError("SMTP_PORT harus berupa angka") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("SMTP_PORT harus di antara 1 dan 65535")
+
+
+def send_email(to_email: str, subject: str, body: str) -> None:
+    _validate_email_settings()
+    host = os.environ["SMTP_HOST"]
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME", "")
+    password = os.getenv("SMTP_PASSWORD", "")
+    sender = os.getenv("SMTP_FROM") or username
+    use_ssl = os.getenv("SMTP_USE_SSL", "false").lower() == "true"
+    use_tls = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    if use_ssl:
+        smtp = smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context())
+    else:
+        smtp = smtplib.SMTP(host, port, timeout=20)
+    with smtp:
+        if not use_ssl:
+            smtp.ehlo()
+            if use_tls:
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(message)
+
+
+async def _deliver_email(to_email: str, subject: str, body: str) -> None:
+    try:
+        await asyncio.to_thread(send_email, to_email, subject, body)
+    except Exception as exc:
+        log.exception("Email delivery failed")
+        raise HTTPException(502, "Email gagal dikirim. Silakan coba lagi nanti.") from exc
+
+
+def _parse_expiry(value: str) -> datetime:
+    return datetime.fromisoformat(value)
 
 
 async def get_current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
@@ -135,9 +229,37 @@ class LoginIn(BaseModel):
     password: str
 
 
+class GoogleLoginIn(BaseModel):
+    credential: str = Field(min_length=1, max_length=8192)
+
+
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetVerifyIn(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6)
+
+
+class PasswordResetCompleteIn(BaseModel):
+    token: str
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordResetDecisionIn(BaseModel):
+    reason: Optional[str] = ""
+
+
 class AdminAccountUpdateIn(BaseModel):
     email: EmailStr
     current_password: str
+
+
+class AdminCreateIn(BaseModel):
+    name: str = Field(min_length=2, max_length=255)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
 
 
 class ProductIn(BaseModel):
@@ -196,6 +318,9 @@ class UmkmCreateIn(BaseModel):
     store_name: str
     address: Optional[str] = ""
     phone: Optional[str] = ""
+    bank_name: Optional[str] = Field(default=None, max_length=64)
+    bank_account_number: Optional[str] = Field(default=None, max_length=64)
+    bank_account_name: Optional[str] = Field(default=None, max_length=255)
 
 
 class StoreSettingsIn(BaseModel):
@@ -276,6 +401,157 @@ async def login(body: LoginIn):
     }
 
 
+@api.post("/auth/google")
+async def google_login(body: GoogleLoginIn):
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    if not client_id:
+        raise HTTPException(503, "Login Google belum dikonfigurasi oleh administrator")
+
+    try:
+        claims = await asyncio.to_thread(verify_google_id_token, body.credential, client_id)
+    except (ValueError, google.auth.exceptions.GoogleAuthError) as exc:
+        raise HTTPException(401, "Token Google tidak valid atau kedaluwarsa") from exc
+
+    if claims.get("email_verified") is not True:
+        raise HTTPException(401, "Email Google belum terverifikasi")
+    email = str(claims.get("email", "")).strip().lower()
+    if not email:
+        raise HTTPException(401, "Token Google tidak memiliki email terverifikasi")
+
+    user = await db.users.get_one({"email": email})
+    if not user or user.get("role") != "admin":
+        raise HTTPException(403, "Email Google ini belum terdaftar sebagai admin")
+
+    token = create_token(user["id"], user["role"], user.get("umkm_id"))
+    await audit(user["id"], "admin_google_login", {"email": email})
+    return {
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user["name"],
+            "role": user["role"],
+            "umkm_id": user.get("umkm_id"),
+        },
+    }
+
+
+@api.post("/auth/password-reset/request")
+async def request_password_reset(body: PasswordResetRequestIn):
+    try:
+        _validate_email_settings()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    email = body.email.lower()
+    account = await db.users.get_one({"email": email})
+    generic_message = "Jika email terdaftar, kode verifikasi akan dikirim ke email tersebut."
+    if not account or account.get("role") != "umkm":
+        return {"message": generic_message}
+
+    active_requests = await db.password_reset_requests.get_many({
+        "user_id": account["id"],
+        "status__in": ["AWAITING_EMAIL", "AWAITING_ADMIN"],
+    })
+    for active_request in active_requests:
+        await db.password_reset_requests.update(
+            {"id": active_request["id"]}, {"status": "SUPERSEDED"}
+        )
+
+    request_id = str(uuid.uuid4())
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    requested_at = datetime.now(timezone.utc)
+    await db.password_reset_requests.insert({
+        "id": request_id,
+        "user_id": account["id"],
+        "email": email,
+        "email_code_hash": _password_reset_digest("email-code", f"{request_id}:{code}"),
+        "email_code_expires_at": (requested_at + timedelta(minutes=10)).isoformat(),
+        "attempts": 0,
+        "status": "AWAITING_EMAIL",
+        "reset_token_hash": None,
+        "reset_token_expires_at": None,
+        "requested_at": requested_at.isoformat(),
+        "email_verified_at": None,
+        "reviewed_at": None,
+        "reviewed_by": None,
+        "rejection_reason": None,
+    })
+    try:
+        await _deliver_email(
+            email,
+            "Kode verifikasi lupa password HawuPay",
+            f"Kode verifikasi Anda: {code}\n\nKode berlaku selama 10 menit. Jika Anda tidak meminta reset password, abaikan email ini.",
+        )
+    except HTTPException:
+        await db.password_reset_requests.update({"id": request_id}, {"status": "EMAIL_FAILED"})
+        raise
+    return {"message": generic_message}
+
+
+@api.post("/auth/password-reset/verify-email")
+async def verify_password_reset_email(body: PasswordResetVerifyIn):
+    email = body.email.lower()
+    if not body.code.isdigit():
+        raise HTTPException(400, "Kode verifikasi tidak valid")
+    requests = await db.password_reset_requests.get_many(
+        {"email": email, "status": "AWAITING_EMAIL"},
+        order_by=("requested_at", "desc"),
+        limit=1,
+    )
+    if not requests:
+        raise HTTPException(400, "Kode verifikasi tidak valid atau kedaluwarsa")
+
+    reset_request = requests[0]
+    if _parse_expiry(reset_request["email_code_expires_at"]) <= datetime.now(timezone.utc):
+        await db.password_reset_requests.update({"id": reset_request["id"]}, {"status": "EXPIRED"})
+        raise HTTPException(400, "Kode verifikasi kedaluwarsa. Minta kode baru.")
+    if reset_request["attempts"] >= 5:
+        await db.password_reset_requests.update({"id": reset_request["id"]}, {"status": "EXPIRED"})
+        raise HTTPException(400, "Batas percobaan terlampaui. Minta kode baru.")
+
+    expected = _password_reset_digest("email-code", f"{reset_request['id']}:{body.code}")
+    if not hmac.compare_digest(expected, reset_request["email_code_hash"]):
+        attempts = reset_request["attempts"] + 1
+        values = {"attempts": attempts}
+        if attempts >= 5:
+            values["status"] = "EXPIRED"
+        await db.password_reset_requests.update({"id": reset_request["id"]}, values)
+        raise HTTPException(400, "Kode verifikasi tidak valid")
+
+    await db.password_reset_requests.update(
+        {"id": reset_request["id"]},
+        {"status": "AWAITING_ADMIN", "email_verified_at": now_iso()},
+    )
+    return {"message": "Email terverifikasi. Permintaan menunggu persetujuan admin."}
+
+
+@api.post("/auth/password-reset/complete")
+async def complete_password_reset(body: PasswordResetCompleteIn):
+    token_hash = _password_reset_digest("reset-token", body.token)
+    reset_request = await db.password_reset_requests.get_one({
+        "reset_token_hash": token_hash,
+        "status": "APPROVED",
+    })
+    if not reset_request:
+        raise HTTPException(400, "Tautan reset tidak valid atau sudah digunakan")
+    if _parse_expiry(reset_request["reset_token_expires_at"]) <= datetime.now(timezone.utc):
+        await db.password_reset_requests.update({"id": reset_request["id"]}, {"status": "EXPIRED"})
+        raise HTTPException(400, "Tautan reset kedaluwarsa. Minta reset password baru.")
+
+    async with db.transaction() as transaction:
+        await transaction.users.update(
+            {"id": reset_request["user_id"]},
+            {"password_hash": hash_password(body.password)},
+        )
+        await transaction.password_reset_requests.update(
+            {"id": reset_request["id"]},
+            {"status": "COMPLETED", "reset_token_hash": None},
+        )
+    await audit(reset_request["user_id"], "password_reset_completed", {}, database=db)
+    return {"message": "Password berhasil diubah. Silakan masuk dengan password baru."}
+
+
 @api.post("/auth/logout")
 async def logout(user=Depends(get_current_user)):
     await audit(user["id"], "logout", {}, user.get("umkm_id"))
@@ -304,6 +580,129 @@ async def me(user=Depends(get_current_user)):
 # ------------------------------------------------------------
 # ADMIN endpoints
 # ------------------------------------------------------------
+@api.get("/admin/admins")
+async def list_admin_accounts(user=Depends(require_admin)):
+    return await db.users.get_many(
+        {"role": "admin"},
+        order_by=("created_at", "asc"),
+        columns=["id", "name", "email", "created_at"],
+    )
+
+
+@api.post("/admin/admins")
+async def create_admin_account(body: AdminCreateIn, user=Depends(require_admin)):
+    email = body.email.lower()
+    existing = await db.users.get_one({"email": email})
+    if existing:
+        raise HTTPException(409, "Email sudah digunakan akun lain")
+
+    admin_id = str(uuid.uuid4())
+    await db.users.insert({
+        "id": admin_id,
+        "email": email,
+        "password_hash": hash_password(body.password),
+        "name": body.name.strip(),
+        "role": "admin",
+        "umkm_id": None,
+        "created_at": now_iso(),
+    })
+    await audit(user["id"], "admin_created", {"new_admin_id": admin_id, "email": email})
+    return {"id": admin_id, "name": body.name.strip(), "email": email, "role": "admin"}
+
+
+@api.get("/admin/password-reset-requests")
+async def list_password_reset_requests(user=Depends(require_admin)):
+    requests = await db.password_reset_requests.get_many(
+        {"status": "AWAITING_ADMIN"}, order_by=("requested_at", "desc"), limit=500
+    )
+    users = await db.users.get_many(columns=["id", "name", "email", "umkm_id"])
+    umkms = await db.umkms.get_many(columns=["id", "store_name"])
+    user_map = {item["id"]: item for item in users}
+    umkm_map = {item["id"]: item for item in umkms}
+    result = []
+    for reset_request in requests:
+        account = user_map.get(reset_request["user_id"], {})
+        store = umkm_map.get(account.get("umkm_id"), {})
+        result.append({
+            "id": reset_request["id"],
+            "email": reset_request["email"],
+            "name": account.get("name", "Kasir UMKM"),
+            "store_name": store.get("store_name", "UMKM"),
+            "requested_at": reset_request["requested_at"],
+            "email_verified_at": reset_request["email_verified_at"],
+        })
+    return result
+
+
+@api.post("/admin/password-reset-requests/{request_id}/approve")
+async def approve_password_reset(request_id: str, user=Depends(require_admin)):
+    reset_request = await db.password_reset_requests.get_one({
+        "id": request_id,
+        "status": "AWAITING_ADMIN",
+    })
+    if not reset_request:
+        raise HTTPException(404, "Permintaan reset tidak ditemukan")
+    try:
+        _validate_email_settings()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    reset_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+    await _deliver_email(
+        reset_request["email"],
+        "Tautan reset password HawuPay",
+        f"Admin telah menyetujui permintaan reset password Anda.\n\nBuka tautan berikut untuk membuat password baru (berlaku 30 menit dan hanya dapat digunakan sekali):\n{reset_link}\n\nJika Anda tidak meminta reset password, abaikan email ini.",
+    )
+    await db.password_reset_requests.update(
+        {"id": request_id, "status": "AWAITING_ADMIN"},
+        {
+            "status": "APPROVED",
+            "reset_token_hash": _password_reset_digest("reset-token", reset_token),
+            "reset_token_expires_at": expires_at.isoformat(),
+            "reviewed_at": now_iso(),
+            "reviewed_by": user["id"],
+        },
+    )
+    await audit(user["id"], "password_reset_approved", {"request_id": request_id})
+    return {"ok": True}
+
+
+@api.post("/admin/password-reset-requests/{request_id}/reject")
+async def reject_password_reset(
+    request_id: str,
+    body: PasswordResetDecisionIn,
+    user=Depends(require_admin),
+):
+    reset_request = await db.password_reset_requests.get_one({
+        "id": request_id,
+        "status": "AWAITING_ADMIN",
+    })
+    if not reset_request:
+        raise HTTPException(404, "Permintaan reset tidak ditemukan")
+    await db.password_reset_requests.update(
+        {"id": request_id},
+        {
+            "status": "REJECTED",
+            "reviewed_at": now_iso(),
+            "reviewed_by": user["id"],
+            "rejection_reason": body.reason or "",
+        },
+    )
+    try:
+        await _deliver_email(
+            reset_request["email"],
+            "Permintaan reset password HawuPay",
+            f"Permintaan reset password Anda tidak disetujui admin.\n\nCatatan: {body.reason or 'Tidak ada catatan' }",
+        )
+    except HTTPException:
+        pass
+    await audit(user["id"], "password_reset_rejected", {"request_id": request_id})
+    return {"ok": True}
+
+
 @api.get("/admin/dashboard")
 async def admin_dashboard(user=Depends(require_admin)):
     today = datetime.now(timezone.utc).date().isoformat()
@@ -360,7 +759,20 @@ async def admin_dashboard(user=Depends(require_admin)):
 
 @api.get("/admin/umkms")
 async def list_umkms(user=Depends(require_admin)):
-    return await db.umkms.get_many(limit=1000)
+    umkms = await db.umkms.get_many(limit=1000)
+    accounts = await db.umkm_payout_accounts.get_many(order_by=("created_at", "desc"), limit=5000)
+    account_by_umkm = {}
+    for account in accounts:
+        account_by_umkm.setdefault(account["umkm_id"], account)
+    for umkm in umkms:
+        account = account_by_umkm.get(umkm["id"])
+        umkm["payout_account"] = None if not account else {
+            "bank_name": account["bank_name"],
+            "account_name": account["account_name"],
+            "masked_account_number": f"••••{account['account_number'][-4:]}",
+            "verification_status": account["verification_status"],
+        }
+    return umkms
 
 
 @api.get("/admin/products")
@@ -417,30 +829,51 @@ async def create_umkm(body: UmkmCreateIn, user=Depends(require_admin)):
     existing = await db.users.get_one({"email": body.email.lower()})
     if existing:
         raise HTTPException(400, "Email sudah terdaftar")
+
+    bank_fields = [body.bank_name, body.bank_account_number, body.bank_account_name]
+    if any(value and value.strip() for value in bank_fields) and not all(value and value.strip() for value in bank_fields):
+        raise HTTPException(400, "Bank, nomor rekening, dan nama pemilik rekening harus diisi lengkap")
+    if body.bank_name and body.bank_name not in {"BRI", "Bank NTT", "DANA"}:
+        raise HTTPException(400, "Tujuan payout saat ini hanya mendukung BRI, Bank NTT, dan DANA")
+
     umkm_id = str(uuid.uuid4())
     user_id = str(uuid.uuid4())
-    await db.umkms.insert({
-        "id": umkm_id,
-        "store_name": body.store_name,
-        "address": body.address,
-        "phone": body.phone,
-        "logo": None,
-        "owner_user_id": user_id,
-        "balance": 0,
-        "active": True,
-        "created_at": now_iso(),
-    })
-    await db.users.insert({
-        "id": user_id,
-        "email": body.email.lower(),
-        "password_hash": hash_password(body.password),
-        "name": body.store_name,
-        "role": "umkm",
-        "umkm_id": umkm_id,
-        "created_at": now_iso(),
-    })
+    created_at = now_iso()
+    async with db.transaction() as transaction:
+        await transaction.umkms.insert({
+            "id": umkm_id,
+            "store_name": body.store_name,
+            "address": body.address,
+            "phone": body.phone,
+            "logo": None,
+            "owner_user_id": user_id,
+            "balance": 0,
+            "active": True,
+            "created_at": created_at,
+        })
+        await transaction.users.insert({
+            "id": user_id,
+            "email": body.email.lower(),
+            "password_hash": hash_password(body.password),
+            "name": body.store_name,
+            "role": "umkm",
+            "umkm_id": umkm_id,
+            "created_at": created_at,
+        })
+        if body.bank_name and body.bank_account_number and body.bank_account_name:
+            await transaction.umkm_payout_accounts.insert({
+                "id": str(uuid.uuid4()),
+                "umkm_id": umkm_id,
+                "bank_name": body.bank_name,
+                "account_number": body.bank_account_number.strip().replace(" ", ""),
+                "account_name": body.bank_account_name.strip(),
+                "verification_status": "PENDING_VERIFICATION",
+                "created_at": created_at,
+                "verified_at": None,
+                "verified_by": None,
+            })
     await audit(user["id"], "umkm_created", {"umkm_id": umkm_id, "store_name": body.store_name})
-    return {"ok": True, "umkm_id": umkm_id}
+    return {"ok": True, "umkm_id": umkm_id, "bank_verification_status": "PENDING_VERIFICATION" if body.bank_name else None}
 
 
 @api.patch("/admin/umkms/{umkm_id}/toggle")
@@ -461,6 +894,7 @@ async def delete_umkm(umkm_id: str, user=Depends(require_admin)):
         raise HTTPException(404, "UMKM tidak ditemukan")
     async with db.transaction() as tx:
         await tx.users.delete_one({"id": umkm.get("owner_user_id")})
+        await tx.umkm_payout_accounts.delete_many({"umkm_id": umkm_id})
         await tx.products.delete_many({"umkm_id": umkm_id})
         await tx.customers.delete_many({"umkm_id": umkm_id})
         await tx.transactions.delete_many({"umkm_id": umkm_id})
@@ -483,12 +917,32 @@ async def get_settlement(user=Depends(require_admin)):
         await db.settlement_config.insert(cfg)
     paid_transactions = await db.transactions.get_many({"status": "PAID"}, columns=["total"], limit=10000)
     total_in = sum(t.get("total", 0) for t in paid_transactions)
+    allocations = await db.settlement_allocations.get_many(limit=50000)
+    shares = {
+        recipient: sum(allocation["amount"] for allocation in allocations if allocation["recipient_type"] == recipient)
+        for recipient in ("UMKM", "PEMDA", "ADMIN")
+    }
+    allocated_transaction_ids = {allocation["transaction_id"] for allocation in allocations}
+    all_paid_transactions = await db.transactions.get_many(
+        {"status": "PAID"}, columns=["id"], limit=10000
+    )
+    unallocated_transactions = sum(
+        transaction["id"] not in allocated_transaction_ids
+        for transaction in all_paid_transactions
+    )
+    pending_allocation_total = sum(
+        allocation["amount"]
+        for allocation in allocations
+        if allocation["status"] != "TRANSFERRED"
+    )
     return {
         "config": {"umkm_pct": cfg["umkm_pct"], "pemkab_pct": cfg["pemkab_pct"], "admin_pct": cfg["admin_pct"]},
         "total_in": total_in,
-        "umkm_share": total_in * cfg["umkm_pct"] / 100,
-        "pemkab_share": total_in * cfg["pemkab_pct"] / 100,
-        "admin_share": total_in * cfg["admin_pct"] / 100,
+        "umkm_share": shares["UMKM"],
+        "pemkab_share": shares["PEMDA"],
+        "admin_share": shares["ADMIN"],
+        "pending_allocation_total": pending_allocation_total,
+        "unallocated_transactions": unallocated_transactions,
     }
 
 
@@ -567,7 +1021,8 @@ async def list_products(approved_only: bool = False, user=Depends(require_umkm))
         {"umkm_id": user["umkm_id"]}, order_by=("created_at", "desc"), limit=1000
     )
     for product in products:
-        product.setdefault("approval_status", "APPROVED")
+        if not product.get("approval_status"):
+            product["approval_status"] = "APPROVED"
     if approved_only:
         products = [p for p in products if p["approval_status"] == "APPROVED"]
     return products
@@ -718,6 +1173,11 @@ async def create_transaction(body: TransactionIn, user=Depends(require_umkm)):
             if duplicate:
                 return {"ok": True, "transaction": duplicate, "duplicate": True}
 
+            settlement_config = await tx.settlement_config.get_one({"id": "default"})
+            if not settlement_config:
+                settlement_config = {"umkm_pct": 90, "pemkab_pct": 8, "admin_pct": 2}
+            shares = calculate_settlement_shares(body.total, settlement_config)
+
             if body.payment_method == "NFC" and body.nfc_card_id:
                 customer = await tx.customers.get_one({"nfc_card_id": body.nfc_card_id})
                 if not customer:
@@ -740,15 +1200,40 @@ async def create_transaction(body: TransactionIn, user=Depends(require_umkm)):
                 if not updated_stock:
                     raise HTTPException(409, "Stok produk tidak cukup atau produk tidak ditemukan")
 
+            allocation_created_at = now_iso()
+            for recipient_type, percentage, recipient_id in (
+                ("UMKM", settlement_config["umkm_pct"], umkm_id),
+                ("PEMDA", settlement_config["pemkab_pct"], None),
+                ("ADMIN", settlement_config["admin_pct"], None),
+            ):
+                await tx.settlement_allocations.insert({
+                    "id": str(uuid.uuid4()),
+                    "transaction_id": txn_id,
+                    "umkm_id": umkm_id,
+                    "recipient_type": recipient_type,
+                    "recipient_id": recipient_id,
+                    "percentage": percentage,
+                    "amount": shares[recipient_type],
+                    "status": "PENDING_ACCOUNT_VERIFICATION",
+                    "created_at": allocation_created_at,
+                    "transfer_reference": None,
+                })
+
             updated_umkm = await tx.umkms.update(
-                {"id": umkm_id}, increments={"balance": body.total}
+                {"id": umkm_id}, increments={"balance": shares["UMKM"]}
             )
             if not updated_umkm:
                 raise HTTPException(404, "UMKM tidak ditemukan")
             await audit(
                 user["id"],
                 "transaction_created",
-                {"txn_id": txn_id, "total": body.total, "method": body.payment_method, "offline": body.offline},
+                {
+                    "txn_id": txn_id,
+                    "total": body.total,
+                    "method": body.payment_method,
+                    "offline": body.offline,
+                    "settlement_shares": {kind: str(amount) for kind, amount in shares.items()},
+                },
                 umkm_id,
                 database=tx,
             )

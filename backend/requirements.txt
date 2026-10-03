@@ -6,3 +6,5 @@ PyJWT>=2.8
 email-validator>=2.0
 SQLAlchemy[asyncio]>=2.0,<3.0
 aiomysql>=0.2
+PyMySQL>=1.1
+google-auth[requests]>=2.0

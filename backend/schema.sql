@@ -20,6 +20,20 @@ CREATE TABLE IF NOT EXISTS umkms (
     created_at VARCHAR(40) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS umkm_payout_accounts (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    umkm_id VARCHAR(36) NOT NULL,
+    bank_name VARCHAR(64) NOT NULL,
+    account_number VARCHAR(64) NOT NULL,
+    account_name VARCHAR(255) NOT NULL,
+    verification_status VARCHAR(32) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    verified_at VARCHAR(40) NULL,
+    verified_by VARCHAR(36) NULL,
+    INDEX ix_umkm_payout_accounts_umkm (umkm_id, created_at),
+    INDEX ix_umkm_payout_accounts_verification (verification_status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS products (
     id VARCHAR(36) NOT NULL PRIMARY KEY,
     umkm_id VARCHAR(36) NOT NULL,
@@ -90,4 +104,39 @@ CREATE TABLE IF NOT EXISTS settlement_config (
     umkm_pct DOUBLE NOT NULL,
     pemkab_pct DOUBLE NOT NULL,
     admin_pct DOUBLE NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS settlement_allocations (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    transaction_id VARCHAR(64) NOT NULL,
+    umkm_id VARCHAR(36) NOT NULL,
+    recipient_type VARCHAR(16) NOT NULL,
+    recipient_id VARCHAR(36) NULL,
+    percentage DECIMAL(5,2) NOT NULL,
+    amount DECIMAL(14,2) NOT NULL,
+    status VARCHAR(40) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    transfer_reference VARCHAR(255) NULL,
+    UNIQUE KEY uq_settlement_transaction_recipient (transaction_id, recipient_type),
+    INDEX ix_settlement_allocations_recipient (recipient_type, recipient_id),
+    INDEX ix_settlement_allocations_status (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS password_reset_requests (
+    id VARCHAR(36) NOT NULL PRIMARY KEY,
+    user_id VARCHAR(36) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    email_code_hash VARCHAR(64) NOT NULL,
+    email_code_expires_at VARCHAR(40) NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    status VARCHAR(32) NOT NULL,
+    reset_token_hash VARCHAR(64) NULL,
+    reset_token_expires_at VARCHAR(40) NULL,
+    requested_at VARCHAR(40) NOT NULL,
+    email_verified_at VARCHAR(40) NULL,
+    reviewed_at VARCHAR(40) NULL,
+    reviewed_by VARCHAR(36) NULL,
+    rejection_reason TEXT NULL,
+    INDEX ix_password_reset_user_status (user_id, status),
+    INDEX ix_password_reset_status_requested (status, requested_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

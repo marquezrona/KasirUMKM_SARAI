@@ -7,8 +7,42 @@ import { Label } from "@/components/ui/label";
 import { ImagePlus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
+const MAX_LOGO_DATA_URL_LENGTH = 55000;
+
+async function compressLogo(file) {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.src = objectUrl;
+    await image.decode();
+
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Logo tidak dapat diproses");
+
+    let maxDimension = 640;
+    for (let resizeAttempt = 0; resizeAttempt < 7; resizeAttempt += 1) {
+      const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+      for (const quality of [0.82, 0.72, 0.62, 0.52, 0.42]) {
+        const compressedLogo = canvas.toDataURL("image/webp", quality);
+        if (compressedLogo.length <= MAX_LOGO_DATA_URL_LENGTH) return compressedLogo;
+      }
+      maxDimension = Math.floor(maxDimension * 0.75);
+    }
+
+    throw new Error("Logo terlalu besar setelah dikompres");
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 export default function Settings() {
   const [form, setForm] = useState({ store_name: "", address: "", phone: "", logo: null });
+  const [compressingLogo, setCompressingLogo] = useState(false);
 
   useEffect(() => { api.get("/umkm/settings").then(r => setForm({
     store_name: r.data.store_name, address: r.data.address || "", phone: r.data.phone || "", logo: r.data.logo
@@ -23,7 +57,7 @@ export default function Settings() {
     } catch (err) { toast.error(err.response?.data?.detail || "Gagal"); }
   };
 
-  const selectLogo = (e) => {
+  const selectLogo = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (!file.type.startsWith("image/")) {
@@ -34,9 +68,16 @@ export default function Settings() {
       toast.error("Ukuran logo maksimal 2 MB");
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => setForm(previous => ({ ...previous, logo: reader.result }));
-    reader.readAsDataURL(file);
+    setCompressingLogo(true);
+    try {
+      const logo = await compressLogo(file);
+      setForm(previous => ({ ...previous, logo }));
+    } catch (error) {
+      toast.error(error.message || "Logo gagal diproses");
+    } finally {
+      setCompressingLogo(false);
+      e.target.value = "";
+    }
   };
 
   return (
@@ -55,7 +96,7 @@ export default function Settings() {
               </div>
               <div className="flex items-center gap-2">
                 <label className="inline-flex h-10 cursor-pointer items-center rounded-md bg-[#0A3663] px-4 text-sm font-medium text-white hover:bg-[#0C2340]">
-                  Pilih Gambar
+                  {compressingLogo ? "Mengompres..." : "Pilih Gambar"}
                   <input type="file" accept="image/png,image/jpeg,image/webp" onChange={selectLogo} className="sr-only" />
                 </label>
                 {form.logo && <Button type="button" variant="outline" onClick={() => setForm({ ...form, logo: null })}><Trash2 className="mr-1.5 h-4 w-4" />Hapus</Button>}
@@ -63,7 +104,7 @@ export default function Settings() {
             </div>
             <p className="mt-2 text-xs text-slate-500">Format PNG, JPG, atau WebP. Maksimal 2 MB.</p>
           </div>
-          <Button type="submit" className="bg-[#0A3663]">Simpan</Button>
+          <Button type="submit" disabled={compressingLogo} className="bg-[#0A3663]">Simpan</Button>
         </form>
       </Card>
     </div>

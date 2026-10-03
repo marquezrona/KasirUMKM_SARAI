@@ -1,7 +1,10 @@
 import os
+import asyncio
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 from dotenv import load_dotenv
@@ -12,6 +15,7 @@ load_dotenv(ROOT_DIR / ".env")
 from sqlalchemy import (
     Boolean,
     Column,
+    Connection,
     Float,
     Index,
     Integer,
@@ -28,8 +32,10 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.sql import ColumnElement
 
 
@@ -59,6 +65,22 @@ umkms = Table(
     Column("balance", Numeric(14, 2), nullable=False, default=0),
     Column("active", Boolean, nullable=False, default=True),
     Column("created_at", String(40), nullable=False),
+)
+
+umkm_payout_accounts = Table(
+    "umkm_payout_accounts",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("umkm_id", String(36), nullable=False),
+    Column("bank_name", String(64), nullable=False),
+    Column("account_number", String(64), nullable=False),
+    Column("account_name", String(255), nullable=False),
+    Column("verification_status", String(32), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("verified_at", String(40)),
+    Column("verified_by", String(36)),
+    Index("ix_umkm_payout_accounts_umkm", "umkm_id", "created_at"),
+    Index("ix_umkm_payout_accounts_verification", "verification_status", "created_at"),
 )
 
 products = Table(
@@ -143,9 +165,48 @@ settlement_config = Table(
     Column("admin_pct", Float, nullable=False),
 )
 
+settlement_allocations = Table(
+    "settlement_allocations",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("transaction_id", String(64), nullable=False),
+    Column("umkm_id", String(36), nullable=False),
+    Column("recipient_type", String(16), nullable=False),
+    Column("recipient_id", String(36)),
+    Column("percentage", Numeric(5, 2), nullable=False),
+    Column("amount", Numeric(14, 2), nullable=False),
+    Column("status", String(40), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("transfer_reference", String(255)),
+    UniqueConstraint("transaction_id", "recipient_type", name="uq_settlement_transaction_recipient"),
+    Index("ix_settlement_allocations_recipient", "recipient_type", "recipient_id"),
+    Index("ix_settlement_allocations_status", "status", "created_at"),
+)
+
+password_reset_requests = Table(
+    "password_reset_requests",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", String(36), nullable=False),
+    Column("email", String(255), nullable=False),
+    Column("email_code_hash", String(64), nullable=False),
+    Column("email_code_expires_at", String(40), nullable=False),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("status", String(32), nullable=False),
+    Column("reset_token_hash", String(64)),
+    Column("reset_token_expires_at", String(40)),
+    Column("requested_at", String(40), nullable=False),
+    Column("email_verified_at", String(40)),
+    Column("reviewed_at", String(40)),
+    Column("reviewed_by", String(36)),
+    Column("rejection_reason", Text),
+    Index("ix_password_reset_user_status", "user_id", "status"),
+    Index("ix_password_reset_status_requested", "status", "requested_at"),
+)
+
 TABLES = {
     table.name: table
-    for table in (users, umkms, products, customers, transactions, audit_logs, settlement_config)
+    for table in (users, umkms, umkm_payout_accounts, products, customers, transactions, audit_logs, settlement_config, settlement_allocations, password_reset_requests)
 }
 
 
@@ -163,22 +224,33 @@ def _build_database_url() -> str:
     if not 1 <= port <= 65535:
         raise RuntimeError("DB_PORT must be between 1 and 65535")
 
-    return str(URL.create(
-        "mysql+aiomysql",
-        username=os.environ["DB_USERNAME"],
-        password=os.getenv("DB_PASSWORD", ""),
-        host=os.environ["DB_HOST"],
-        port=port,
-        database=os.environ["DB_DATABASE"],
-        query={"charset": "utf8mb4"},
-    ))
+    username = quote(os.environ["DB_USERNAME"], safe="")
+    password = quote(os.getenv("DB_PASSWORD", ""), safe="")
+    database = quote(os.environ["DB_DATABASE"], safe="")
+    host = os.environ["DB_HOST"]
+
+    return f"mysql+pymysql://{username}:{password}@{host}:{port}/{database}?charset=utf8mb4"
 
 
 class TableStore:
-    def __init__(self, engine: AsyncEngine, table: Table, connection: AsyncConnection | None = None):
+    def __init__(self, engine: Engine | AsyncEngine, table: Table, connection: Connection | AsyncConnection | None = None):
         self.engine = engine
         self.table = table
         self.connection = connection
+
+    def _is_async_engine(self) -> bool:
+        return isinstance(self.engine, AsyncEngine)
+
+    @contextmanager
+    def _sync_connection(self, write: bool = False):
+        if self.connection is not None:
+            yield self.connection
+        elif write:
+            with self.engine.begin() as connection:
+                yield connection
+        else:
+            with self.engine.connect() as connection:
+                yield connection
 
     def _conditions(self, filters: dict[str, Any] | None) -> list[ColumnElement[bool]]:
         conditions = []
@@ -234,10 +306,19 @@ class TableStore:
         columns: list[str] | None = None,
         omit: set[str] | None = None,
     ) -> dict[str, Any] | None:
-        statement = self._statement(columns, omit).where(*self._conditions(filters)).limit(1)
-        async with self._connection() as connection:
-            result = await connection.execute(statement)
-            return self._row_dict(result.first())
+        if self._is_async_engine():
+            statement = self._statement(columns, omit).where(*self._conditions(filters)).limit(1)
+            async with self._connection() as connection:
+                result = await connection.execute(statement)
+                return self._row_dict(result.first())
+
+        def read_sync():
+            statement = self._statement(columns, omit).where(*self._conditions(filters)).limit(1)
+            with self._sync_connection() as connection:
+                result = connection.execute(statement)
+                return self._row_dict(result.first())
+
+        return read_sync() if self.connection is not None else await asyncio.to_thread(read_sync)
 
     async def get_many(
         self,
@@ -247,19 +328,44 @@ class TableStore:
         columns: list[str] | None = None,
         omit: set[str] | None = None,
     ) -> list[dict[str, Any]]:
-        statement = self._statement(columns, omit).where(*self._conditions(filters))
-        if order_by:
-            column = self.table.c[order_by[0]]
-            statement = statement.order_by(column.desc() if order_by[1].lower() == "desc" else column.asc())
-        if limit is not None:
-            statement = statement.limit(limit)
-        async with self._connection() as connection:
-            result = await connection.execute(statement)
-            return [self._row_dict(row) for row in result.fetchall()]
+        if self._is_async_engine():
+            statement = self._statement(columns, omit).where(*self._conditions(filters))
+            if order_by:
+                column = self.table.c[order_by[0]]
+                statement = statement.order_by(column.desc() if order_by[1].lower() == "desc" else column.asc())
+            if limit is not None:
+                statement = statement.limit(limit)
+            async with self._connection() as connection:
+                result = await connection.execute(statement)
+                return [self._row_dict(row) for row in result.fetchall()]
+
+        def read_sync():
+            statement = self._statement(columns, omit).where(*self._conditions(filters))
+            if order_by:
+                column = self.table.c[order_by[0]]
+                statement = statement.order_by(column.desc() if order_by[1].lower() == "desc" else column.asc())
+            if limit is not None:
+                statement = statement.limit(limit)
+            with self._sync_connection() as connection:
+                result = connection.execute(statement)
+                return [self._row_dict(row) for row in result.fetchall()]
+
+        return read_sync() if self.connection is not None else await asyncio.to_thread(read_sync)
 
     async def insert(self, values: dict[str, Any]) -> None:
-        async with self._connection(write=True) as connection:
-            await connection.execute(insert(self.table).values(**values))
+        if self._is_async_engine():
+            async with self._connection(write=True) as connection:
+                await connection.execute(insert(self.table).values(**values))
+            return
+
+        def write_sync():
+            with self._sync_connection(write=True) as connection:
+                connection.execute(insert(self.table).values(**values))
+
+        if self.connection is not None:
+            write_sync()
+        else:
+            await asyncio.to_thread(write_sync)
 
     async def update(
         self,
@@ -268,69 +374,139 @@ class TableStore:
         increments: dict[str, Any] | None = None,
         upsert: bool = False,
     ) -> bool:
-        changes = dict(values or {})
-        for field, amount in (increments or {}).items():
-            changes[field] = self.table.c[field] + amount
-        conditions = self._conditions(filters)
-        async with self._connection(write=True) as connection:
-            primary_key = next(iter(self.table.primary_key.columns))
-            existing = await connection.execute(
-                select(primary_key).where(*conditions).limit(1)
-            )
-            if existing.first() is None:
-                if not upsert:
-                    return False
-                equality_filters = {key: value for key, value in filters.items() if "__" not in key}
-                await connection.execute(insert(self.table).values(**equality_filters, **(values or {})))
-                return True
-            if upsert:
+        if self._is_async_engine():
+            changes = dict(values or {})
+            for field, amount in (increments or {}).items():
+                changes[field] = self.table.c[field] + amount
+            conditions = self._conditions(filters)
+            async with self._connection(write=True) as connection:
+                primary_key = next(iter(self.table.primary_key.columns))
+                existing = await connection.execute(
+                    select(primary_key).where(*conditions).limit(1)
+                )
+                if existing.first() is None:
+                    if not upsert:
+                        return False
+                    equality_filters = {key: value for key, value in filters.items() if "__" not in key}
+                    await connection.execute(insert(self.table).values(**equality_filters, **(values or {})))
+                    return True
+                if upsert:
+                    await connection.execute(update(self.table).where(*conditions).values(**changes))
+                    return True
                 await connection.execute(update(self.table).where(*conditions).values(**changes))
                 return True
-            await connection.execute(update(self.table).where(*conditions).values(**changes))
-            return True
+
+        def write_sync():
+            changes = dict(values or {})
+            for field, amount in (increments or {}).items():
+                changes[field] = self.table.c[field] + amount
+            conditions = self._conditions(filters)
+            with self._sync_connection(write=True) as connection:
+                primary_key = next(iter(self.table.primary_key.columns))
+                existing = connection.execute(select(primary_key).where(*conditions).limit(1))
+                if existing.first() is None:
+                    if not upsert:
+                        return False
+                    equality_filters = {key: value for key, value in filters.items() if "__" not in key}
+                    connection.execute(insert(self.table).values(**equality_filters, **(values or {})))
+                    return True
+                if upsert:
+                    connection.execute(update(self.table).where(*conditions).values(**changes))
+                    return True
+                connection.execute(update(self.table).where(*conditions).values(**changes))
+                return True
+
+        return write_sync() if self.connection is not None else await asyncio.to_thread(write_sync)
 
     async def delete_one(self, filters: dict[str, Any]) -> bool:
-        async with self._connection(write=True) as connection:
-            result = await connection.execute(delete(self.table).where(*self._conditions(filters)))
-            return bool(result.rowcount)
+        if self._is_async_engine():
+            async with self._connection(write=True) as connection:
+                result = await connection.execute(delete(self.table).where(*self._conditions(filters)))
+                return bool(result.rowcount)
+
+        def write_sync():
+            with self._sync_connection(write=True) as connection:
+                result = connection.execute(delete(self.table).where(*self._conditions(filters)))
+                return bool(result.rowcount)
+
+        return write_sync() if self.connection is not None else await asyncio.to_thread(write_sync)
 
     async def delete_many(self, filters: dict[str, Any]) -> int:
-        async with self._connection(write=True) as connection:
-            result = await connection.execute(delete(self.table).where(*self._conditions(filters)))
-            return result.rowcount or 0
+        if self._is_async_engine():
+            async with self._connection(write=True) as connection:
+                result = await connection.execute(delete(self.table).where(*self._conditions(filters)))
+                return result.rowcount or 0
+
+        def write_sync():
+            with self._sync_connection(write=True) as connection:
+                result = connection.execute(delete(self.table).where(*self._conditions(filters)))
+                return result.rowcount or 0
+
+        return write_sync() if self.connection is not None else await asyncio.to_thread(write_sync)
 
     async def count(self, filters: dict[str, Any] | None = None) -> int:
-        statement = select(func.count()).select_from(self.table).where(*self._conditions(filters))
-        async with self._connection() as connection:
-            result = await connection.execute(statement)
-            return int(result.scalar_one())
+        if self._is_async_engine():
+            statement = select(func.count()).select_from(self.table).where(*self._conditions(filters))
+            async with self._connection() as connection:
+                result = await connection.execute(statement)
+                return int(result.scalar_one())
+
+        def read_sync():
+            statement = select(func.count()).select_from(self.table).where(*self._conditions(filters))
+            with self._sync_connection() as connection:
+                result = connection.execute(statement)
+                return int(result.scalar_one())
+
+        return read_sync() if self.connection is not None else await asyncio.to_thread(read_sync)
 
 
 class Database:
-    def __init__(self, engine: AsyncEngine):
+    def __init__(self, engine: Engine | AsyncEngine):
         self.engine = engine
 
     @classmethod
     def from_environment(cls) -> "Database":
         url = _build_database_url()
         if str(url).startswith("sqlite"):
-            return cls(create_async_engine(url))
-        return cls(create_async_engine(url, pool_pre_ping=True, pool_recycle=1800, connect_args={"connect_timeout": 10}))
+            normalized = url.replace("sqlite+aiosqlite", "sqlite+pysqlite")
+            return cls(create_engine(normalized))
+        return cls(create_engine(url, pool_pre_ping=True, pool_recycle=1800, connect_args={"connect_timeout": 10}))
 
     async def check_connection(self) -> None:
-        async with self.engine.connect() as connection:
-            await connection.execute(select(1))
+        if isinstance(self.engine, AsyncEngine):
+            async with self.engine.connect() as connection:
+                await connection.execute(select(1))
+            return
+
+        def sync_check():
+            with self.engine.connect() as connection:
+                connection.execute(select(1)).scalar()
+
+        await asyncio.to_thread(sync_check)
 
     async def create_schema(self) -> None:
-        async with self.engine.begin() as connection:
-            await connection.run_sync(metadata.create_all)
+        if isinstance(self.engine, AsyncEngine):
+            async with self.engine.begin() as connection:
+                await connection.run_sync(metadata.create_all)
+            return
+
+        await asyncio.to_thread(metadata.create_all, self.engine)
 
     async def dispose(self) -> None:
-        await self.engine.dispose()
+        if isinstance(self.engine, AsyncEngine):
+            await self.engine.dispose()
+            return
+
+        await asyncio.to_thread(self.engine.dispose)
 
     @asynccontextmanager
     async def transaction(self):
-        async with self.engine.begin() as connection:
+        if isinstance(self.engine, AsyncEngine):
+            async with self.engine.begin() as connection:
+                yield BoundDatabase(self.engine, connection)
+            return
+
+        with self.engine.begin() as connection:
             yield BoundDatabase(self.engine, connection)
 
     def __getattr__(self, name: str) -> TableStore:
@@ -340,7 +516,7 @@ class Database:
 
 
 class BoundDatabase:
-    def __init__(self, engine: AsyncEngine, connection: AsyncConnection):
+    def __init__(self, engine: Engine | AsyncEngine, connection: Connection | AsyncConnection):
         self.engine = engine
         self.connection = connection
 

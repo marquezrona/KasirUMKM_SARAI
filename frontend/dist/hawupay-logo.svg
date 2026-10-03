@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="gold" x1="24" y1="8" x2="102" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFC52D" />
+      <stop offset="1" stop-color="#E6A100" />
+    </linearGradient>
+    <linearGradient id="navy" x1="34" y1="35" x2="80" y2="91" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B4770" />
+      <stop offset=".48" stop-color="#0A3663" />
+      <stop offset="1" stop-color="#061A31" />
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="1" dy="3" stdDeviation="2" flood-color="#071B2C" flood-opacity=".6" />
+    </filter>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="22" fill="url(#gold)" stroke="#C88700" stroke-width="3" />
+  <text x="20" y="78" font-family="Georgia, 'Times New Roman', serif" font-size="58" font-weight="700" fill="url(#navy)" stroke="#FFE08A" stroke-width="1.5" paint-order="stroke" filter="url(#shadow)">H</text>
+  <text x="47" y="87" font-family="Georgia, 'Times New Roman', serif" font-size="51" font-weight="700" fill="url(#navy)" stroke="#FFE08A" stroke-width="1.5" paint-order="stroke" filter="url(#shadow)">W</text>
+</svg>

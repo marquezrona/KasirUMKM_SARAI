@@ -8,13 +8,15 @@ import { Badge } from "@/components/ui/badge";
 import {
   LayoutDashboard, ShoppingCart, Package, Users, Receipt, BarChart3,
   Settings, LogOut, Wifi, WifiOff, Building2, Landmark, ScrollText,
-  RefreshCw, Radio, Store, ClipboardCheck, MoreHorizontal
+  RefreshCw, Radio, Store, ClipboardCheck, KeyRound, MoreHorizontal
 } from "lucide-react";
 
 const adminNav = [
   { to: "/admin", label: "Dashboard", icon: LayoutDashboard, end: true },
+  { to: "/admin/admins", label: "Akun Admin", icon: Users },
   { to: "/admin/umkms", label: "UMKM", icon: Building2 },
   { to: "/admin/product-approvals", label: "Persetujuan Produk", icon: ClipboardCheck },
+  { to: "/admin/password-resets", label: "Reset Password", icon: KeyRound },
   { to: "/admin/transactions", label: "Transaksi", icon: Receipt },
   { to: "/admin/settlement", label: "Settlement", icon: Landmark },
   { to: "/admin/audit", label: "Audit Log", icon: ScrollText },
@@ -36,6 +38,7 @@ export default function Layout() {
   const { online, forceOffline, toggleForceOffline, pending, syncing, syncNow } = useOffline();
   const [logoutOpen, setLogoutOpen] = useState(false);
   const [pendingProducts, setPendingProducts] = useState(0);
+  const [pendingPasswordResets, setPendingPasswordResets] = useState(0);
   const [storeLogo, setStoreLogo] = useState(null);
   const [moreOpen, setMoreOpen] = useState(false);
   const nav = useNavigate();
@@ -60,6 +63,21 @@ export default function Layout() {
   }, [isAdmin]);
 
   useEffect(() => {
+    if (!isAdmin) return undefined;
+    const loadPasswordResets = async () => {
+      try {
+        const { data } = await api.get("/admin/password-reset-requests");
+        setPendingPasswordResets(data.length);
+      } catch {
+        setPendingPasswordResets(0);
+      }
+    };
+    loadPasswordResets();
+    const timer = window.setInterval(loadPasswordResets, 30000);
+    return () => window.clearInterval(timer);
+  }, [isAdmin]);
+
+  useEffect(() => {
     if (!user || isAdmin) return undefined;
     const updateLogo = event => setStoreLogo(event.detail || null);
     api.get("/umkm/settings").then(({ data }) => setStoreLogo(data.logo || null)).catch(() => setStoreLogo(null));
@@ -79,7 +97,13 @@ export default function Layout() {
       <header className="h-16 bg-white border-b border-[#E5DEC9] flex items-center px-4 sm:px-6 gap-4 sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 overflow-hidden rounded-xl bg-[#0A3663] flex items-center justify-center">
-            {storeLogo ? <img src={storeLogo} alt="Logo toko" className="h-full w-full object-cover" /> : <Store className="w-5 h-5 text-[#E6A100]" />}
+            {storeLogo ? (
+              <img src={storeLogo} alt="Logo toko" className="h-full w-full object-cover" />
+            ) : isAdmin ? (
+              <img src="/hawupay-logo.svg" alt="Logo HawuPay" className="h-full w-full object-cover" />
+            ) : (
+              <Store className="w-5 h-5 text-[#E6A100]" />
+            )}
           </div>
           <div>
             <div className="font-display font-bold text-[#0C2340] leading-tight">HawuPay</div>
@@ -159,6 +183,11 @@ export default function Layout() {
                   {it.to === "/admin/product-approvals" && pendingProducts > 0 && (
                     <Badge className="min-w-6 justify-center border-red-200 bg-red-100 px-1.5 text-red-700">
                       {pendingProducts > 99 ? "99+" : pendingProducts}
+                    </Badge>
+                  )}
+                  {it.to === "/admin/password-resets" && pendingPasswordResets > 0 && (
+                    <Badge className="min-w-6 justify-center border-red-200 bg-red-100 px-1.5 text-red-700">
+                      {pendingPasswordResets > 99 ? "99+" : pendingPasswordResets}
                     </Badge>
                   )}
                 </NavLink>

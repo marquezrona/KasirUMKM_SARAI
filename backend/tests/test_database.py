@@ -1,7 +1,9 @@
+import os
 import unittest
 
 from sqlalchemy.dialects import mysql
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.schema import CreateTable
 
 from backend.database import Database, metadata
@@ -9,7 +11,11 @@ from backend.database import Database, metadata
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        self.engine = create_engine(
+            "sqlite+pysqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         self.database = Database(self.engine)
         await self.database.create_schema()
 
@@ -54,7 +60,7 @@ class MySQLDdlTests(unittest.TestCase):
             str(CreateTable(table).compile(dialect=mysql.dialect()))
             for table in metadata.sorted_tables
         ]
-        self.assertEqual(len(compiled), 7)
+        self.assertEqual(len(compiled), 10)
         self.assertTrue(all("CREATE TABLE" in statement for statement in compiled))
 
     def test_database_from_environment_falls_back_to_sqlite(self):
@@ -63,8 +69,26 @@ class MySQLDdlTests(unittest.TestCase):
             for name in ("DB_HOST", "DB_DATABASE", "DB_USERNAME", "DB_PORT"):
                 os.environ.pop(name, None)
             db = Database.from_environment()
-            self.assertTrue(str(db.engine.url).startswith("sqlite+aiosqlite"))
-            self.addCleanup(lambda: db.dispose())
+            self.assertTrue(str(db.engine.url).startswith("sqlite+pysqlite"))
+            self.addCleanup(db.engine.dispose)
+        finally:
+            for name, value in original.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_database_url_escapes_password_special_chars(self):
+        original = {name: os.environ.get(name) for name in ("DB_HOST", "DB_DATABASE", "DB_USERNAME", "DB_PASSWORD", "DB_PORT")}
+        try:
+            os.environ["DB_HOST"] = "127.0.0.1"
+            os.environ["DB_DATABASE"] = "app_db"
+            os.environ["DB_USERNAME"] = "user_name"
+            os.environ["DB_PASSWORD"] = "H4wUPay@Sabu"
+            os.environ["DB_PORT"] = "3306"
+            url = __import__("backend.database", fromlist=["_build_database_url"])._build_database_url()
+            self.assertIn("H4wUPay%40Sabu", url)
+            self.assertNotIn("H4wUPay@Sabu@127.0.0.1", url)
         finally:
             for name, value in original.items():
                 if value is None:

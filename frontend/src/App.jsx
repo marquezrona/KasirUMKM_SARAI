@@ -5,10 +5,14 @@ import { Toaster } from "@/components/ui/sonner";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
+import ForgotPassword from "@/pages/ForgotPassword";
+import ResetPassword from "@/pages/ResetPassword";
 import AdminDashboard from "@/pages/admin/AdminDashboard";
+import AdminAdmins from "@/pages/admin/AdminAdmins";
 import AdminUmkms from "@/pages/admin/AdminUmkms";
 import AdminUmkmProducts from "@/pages/admin/AdminUmkmProducts";
 import AdminProductApprovals from "@/pages/admin/AdminProductApprovals";
+import AdminPasswordResets from "@/pages/admin/AdminPasswordResets";
 import AdminTransactions from "@/pages/admin/AdminTransactions";
 import AdminSettlement from "@/pages/admin/AdminSettlement";
 import AdminAuditLog from "@/pages/admin/AdminAuditLog";
@@ -29,13 +33,17 @@ function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<Login />} />
+            <Route path="/forgot-password" element={<ForgotPassword />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
             <Route path="/" element={<Navigate to="/login" replace />} />
 
             <Route path="/admin" element={<ProtectedRoute role="admin"><Layout /></ProtectedRoute>}>
               <Route index element={<AdminDashboard />} />
+              <Route path="admins" element={<AdminAdmins />} />
               <Route path="umkms" element={<AdminUmkms />} />
               <Route path="umkms/:umkmId/products" element={<AdminUmkmProducts />} />
               <Route path="product-approvals" element={<AdminProductApprovals />} />
+              <Route path="password-resets" element={<AdminPasswordResets />} />
               <Route path="transactions" element={<AdminTransactions />} />
               <Route path="settlement" element={<AdminSettlement />} />
               <Route path="audit" element={<AdminAuditLog />} />

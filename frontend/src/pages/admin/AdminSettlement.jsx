@@ -72,6 +72,19 @@ export default function AdminSettlement() {
           Catatan: Ini adalah ledger simulasi. Transfer dana nyata memerlukan integrasi banking API resmi.
         </div>
       </Card>
+
+      <Card className="max-w-2xl border-[#E5DEC9] p-5">
+        <h3 className="font-display font-bold text-lg text-[#0C2340]">Status Alokasi</h3>
+        <p className="mt-2 text-sm text-slate-600">
+          Tercatat menunggu rekening dan verifikasi: <strong>{rp(data.pending_allocation_total)}</strong>.
+          Alokasi ini belum merupakan transfer bank.
+        </p>
+        {data.unallocated_transactions > 0 && (
+          <p className="mt-2 text-sm text-amber-800">
+            {data.unallocated_transactions} transaksi lama belum memiliki catatan alokasi.
+          </p>
+        )}
+      </Card>
     </div>
   );
 }

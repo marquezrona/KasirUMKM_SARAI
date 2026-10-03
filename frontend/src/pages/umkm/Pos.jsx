@@ -156,7 +156,11 @@ export default function Pos() {
                 className="pos-card text-left bg-white border border-[#E5DEC9] rounded-xl p-4 disabled:opacity-40"
               >
                 <div className="w-full aspect-square rounded-lg bg-gradient-to-br from-[#F7F4EF] to-[#FFF8E7] flex items-center justify-center mb-3">
-                  <Package className="w-10 h-10 text-[#A63A2B]/40" />
+                  {p.image ? (
+                    <img src={p.image} alt={p.name} loading="lazy" className="h-full w-full rounded-lg object-cover" />
+                  ) : (
+                    <Package className="w-10 h-10 text-[#A63A2B]/40" />
+                  )}
                 </div>
                 <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">{p.category}</div>
                 <div className="font-semibold text-sm text-[#0C2340] line-clamp-2 mt-0.5">{p.name}</div>
