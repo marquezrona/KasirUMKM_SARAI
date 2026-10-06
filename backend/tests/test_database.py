@@ -1,11 +1,13 @@
 import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.dialects import mysql
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.schema import CreateTable
 
+from backend import server
 from backend.database import Database, metadata
 
 
@@ -95,6 +97,32 @@ class MySQLDdlTests(unittest.TestCase):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = value
+
+
+class DatabaseStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_does_not_switch_database_when_configured_database_fails(self):
+        original_database = server.db
+        original_backup_task = server.database_backup_task
+        unavailable_database = type("UnavailableDatabase", (), {})()
+        unavailable_database.check_connection = AsyncMock(
+            side_effect=ConnectionError("database unavailable")
+        )
+        unavailable_database.dispose = AsyncMock()
+
+        try:
+            with patch.object(
+                server.Database, "from_environment", return_value=unavailable_database
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Database connection or schema initialization failed"
+                ):
+                    await server.startup()
+
+            unavailable_database.dispose.assert_awaited_once()
+            self.assertIsNone(server.db)
+        finally:
+            server.db = original_database
+            server.database_backup_task = original_backup_task
 
 
 if __name__ == "__main__":

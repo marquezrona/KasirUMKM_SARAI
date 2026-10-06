@@ -16,7 +16,11 @@ Project ini menggunakan Laragon untuk MySQL. Backend-nya adalah Python/FastAPI d
    DB_PASSWORD=H4wUPay@Sabu
    ```
 
-4. Tabel dan data awal aplikasi sudah tersimpan di database serta dicadangkan di `backend/database_dump.sql`.
+4. Tabel dan data awal aplikasi sudah tersimpan di database serta dicadangkan di `backend/database_dump.sql`. Dump tersebut adalah cadangan awal, bukan salinan otomatis dari perubahan terbaru.
+
+Backend selalu menggunakan database yang ditentukan oleh `DB_*` di `backend/.env`. Jika MySQL yang dikonfigurasi tidak tersedia, backend sekarang berhenti dengan pesan error dan tidak diam-diam membuka database SQLite lain. SQLite lokal (`backend/local.db`) hanya digunakan bila konfigurasi koneksi MySQL tidak diisi. Pastikan MySQL Laragon aktif sebelum menjalankan aplikasi agar data yang sama selalu digunakan.
+
+Saat backend berjalan, database MySQL dicadangkan otomatis sekali sehari ke folder `backend/backups` dalam format `.sql.gz`; backup terbaru hari itu menggantikan backup sebelumnya dan 30 backup harian terakhir disimpan. Cadangan pertama dibuat saat backend mulai berjalan. Perintah `mysqldump` perlu tersedia di PATH atau instalasi Laragon (atau atur `MYSQLDUMP_PATH` di `backend/.env`). Status backup terlihat pada log backend. File backup berisi seluruh data database; simpan folder ini di lokasi yang aman.
 
 ## 2. Menjalankan Backend
 

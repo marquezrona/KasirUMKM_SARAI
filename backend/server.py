@@ -28,13 +28,14 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
 from database import Database
+from backup import run_daily_database_backups
 
 # ------------------------------------------------------------
 # Setup
 # ------------------------------------------------------------
 db: Database | None = None
+database_backup_task: asyncio.Task | None = None
 
 JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALG = "HS256"
@@ -1378,26 +1379,23 @@ DEMO_CUSTOMERS = [
 
 @app.on_event("startup")
 async def startup():
-    global db
+    global db, database_backup_task
+    db = None
     try:
         db = Database.from_environment()
         await db.check_connection()
         await db.create_schema()
         log.info("Database connected using configured environment")
     except Exception as exc:
-        local_db_path = (ROOT_DIR / "local.db").resolve()
-        try:
-            db = Database(create_async_engine(f"sqlite+aiosqlite:///{local_db_path.as_posix()}"))
-            await db.check_connection()
-            await db.create_schema()
-            log.warning("MySQL connection unavailable; falling back to SQLite at %s", local_db_path)
-        except Exception as fallback_exc:
-            if db is not None:
-                await db.dispose()
-            db = None
-            log.error("MySQL connection or schema initialization failed: %s", exc)
-            log.error("SQLite fallback failed: %s", fallback_exc)
-            raise RuntimeError("Database connection or schema initialization failed") from exc
+        failed_database = db
+        db = None
+        if failed_database is not None:
+            try:
+                await failed_database.dispose()
+            except Exception:
+                log.exception("Failed to dispose database engine after startup failure")
+        log.exception("Database connection or schema initialization failed")
+        raise RuntimeError("Database connection or schema initialization failed") from exc
 
     # seed admin
     admin_email = os.environ["ADMIN_EMAIL"].lower()
@@ -1479,9 +1477,22 @@ async def startup():
     if not cfg:
         await db.settlement_config.insert({"id": "default", "umkm_pct": 90, "pemkab_pct": 8, "admin_pct": 2})
 
+    database_backup_task = asyncio.create_task(
+        run_daily_database_backups(),
+        name="daily-database-backups",
+    )
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    global database_backup_task
+    if database_backup_task is not None:
+        database_backup_task.cancel()
+        try:
+            await database_backup_task
+        except asyncio.CancelledError:
+            pass
+        database_backup_task = None
     if db is not None:
         await db.dispose()
 
