@@ -164,26 +164,6 @@ export default function Login() {
             )}
           </div>
 
-          <div className="mt-4 p-3 bg-amber-50/80 border border-amber-200/80 rounded-xl text-xs space-y-2">
-            <div className="font-semibold text-amber-900">⚡ Akses Cepat (Klik untuk isi akun):</div>
-            <div className="flex flex-col sm:flex-row gap-2">
-              <button
-                type="button"
-                onClick={() => quickFill("admin@umkm.id", "admin123")}
-                className="flex-1 py-1.5 px-2 bg-white hover:bg-amber-100 border border-amber-300 rounded-lg text-amber-900 font-medium text-left transition-colors"
-              >
-                👑 <b>Admin:</b> admin@umkm.id
-              </button>
-              <button
-                type="button"
-                onClick={() => quickFill("sinar.raijua@umkm.id", "umkm123")}
-                className="flex-1 py-1.5 px-2 bg-white hover:bg-amber-100 border border-amber-300 rounded-lg text-amber-900 font-medium text-left transition-colors"
-              >
-                🏪 <b>UMKM:</b> sinar.raijua
-              </button>
-            </div>
-          </div>
-
         </Card>
       </div>
     </div>
