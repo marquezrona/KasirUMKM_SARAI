@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="frontend/public/hawupay-logo.svg" alt="Logo HawuPay" width="140">
+</p>
+
 # HawuPay
 
 **HawuPay** adalah aplikasi kasir digital untuk membantu pelaku UMKM di Sabu Raijua mengelola penjualan dan operasional toko dalam satu aplikasi.
