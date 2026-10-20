@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { listOfflineTxns } from "@/lib/db";
 import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -9,16 +10,29 @@ import { useOffline } from "@/context/OfflineContext";
 import { Search, X } from "lucide-react";
 
 const rp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
+const periodKey = (value, period) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  if (period === "year") return String(year);
+  if (period === "month") return `${year}-${month}`;
+  return `${year}-${month}-${day}`;
+};
 
 export default function Transactions() {
   const [txns, setTxns] = useState([]);
   const [offline, setOffline] = useState([]);
   const [query, setQuery] = useState("");
   const [groupBy, setGroupBy] = useState("day");
+  const [selectedDay, setSelectedDay] = useState("");
+  const [selectedMonth, setSelectedMonth] = useState("");
+  const [selectedYear, setSelectedYear] = useState("");
   const { pending } = useOffline();
 
   const load = async () => {
-    try { const { data } = await api.get("/umkm/transactions"); setTxns(data); } catch {}
+    try { const { data } = await api.get("/umkm/transactions?limit=10000"); setTxns(data); } catch {}
     setOffline(await listOfflineTxns());
   };
   useEffect(() => { load(); }, [pending]);
@@ -38,26 +52,32 @@ export default function Transactions() {
 
   const filteredTxns = useMemo(() => {
     const value = query.trim().toLowerCase();
-    if (!value) return txns;
-    return txns.filter(txn => [txn.id, txn.payment_method, txn.status, txn.sync_status, txn.total]
-      .some(field => String(field || "").toLowerCase().includes(value)));
-  }, [txns, query]);
+    const selectedPeriod = groupBy === "day" ? selectedDay : groupBy === "month" ? selectedMonth : selectedYear;
+    return txns.filter(txn => {
+      const matchesQuery = !value || [txn.id, txn.payment_method, txn.status, txn.sync_status, txn.total]
+        .some(field => String(field || "").toLowerCase().includes(value));
+      return matchesQuery && (!selectedPeriod || periodKey(txn.created_at, groupBy) === selectedPeriod);
+    });
+  }, [txns, query, groupBy, selectedDay, selectedMonth, selectedYear]);
 
   const filteredOffline = useMemo(() => {
     const value = query.trim().toLowerCase();
-    if (!value) return offline;
-    return offline.filter(txn => [txn.client_txn_id, txn.payment_method, txn.total]
-      .some(field => String(field || "").toLowerCase().includes(value)));
-  }, [offline, query]);
+    const selectedPeriod = groupBy === "day" ? selectedDay : groupBy === "month" ? selectedMonth : selectedYear;
+    return offline.filter(txn => {
+      const matchesQuery = !value || [txn.client_txn_id, txn.payment_method, txn.total]
+        .some(field => String(field || "").toLowerCase().includes(value));
+      return matchesQuery && (!selectedPeriod || periodKey(txn.created_at_client, groupBy) === selectedPeriod);
+    });
+  }, [offline, query, groupBy, selectedDay, selectedMonth, selectedYear]);
+
+  const availableYears = useMemo(() => [...new Set([...txns.map(txn => txn.created_at), ...offline.map(txn => txn.created_at_client)]
+    .map(value => periodKey(value, "year"))
+    .filter(year => year !== "unknown"))].sort((a, b) => b.localeCompare(a)), [txns, offline]);
 
   const groupedTxns = useMemo(() => {
     const groups = new Map();
     filteredTxns.forEach(transaction => {
-      const date = new Date(transaction.created_at);
-      const validDate = !Number.isNaN(date.getTime());
-      const key = !validDate ? "unknown" : groupBy === "day"
-        ? date.toISOString().slice(0, 10)
-        : groupBy === "month" ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 4);
+      const key = periodKey(transaction.created_at, groupBy);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(transaction);
     });
@@ -69,6 +89,12 @@ export default function Transactions() {
       transactions,
     }));
   }, [filteredTxns, groupBy]);
+
+  const clearPeriod = () => {
+    setSelectedDay("");
+    setSelectedMonth("");
+    setSelectedYear("");
+  };
 
   return (
     <div className="space-y-6">
@@ -98,6 +124,33 @@ export default function Transactions() {
           <button type="button" onClick={() => setGroupBy("month")} className={`rounded-md px-3 py-1.5 text-sm font-semibold ${groupBy === "month" ? "bg-[#0A3663] text-white" : "text-[#0C2340]"}`}>Per Bulan</button>
           <button type="button" onClick={() => setGroupBy("year")} className={`rounded-md px-3 py-1.5 text-sm font-semibold ${groupBy === "year" ? "bg-[#0A3663] text-white" : "text-[#0C2340]"}`}>Per Tahun</button>
         </div>
+      </div>
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="space-y-1">
+          <label htmlFor="transaction-period" className="text-sm font-medium text-slate-700">
+            {groupBy === "day" ? "Pilih tanggal" : groupBy === "month" ? "Pilih bulan" : "Pilih tahun"}
+          </label>
+          {groupBy === "day" && (
+            <Input id="transaction-period" type="date" value={selectedDay} onChange={event => setSelectedDay(event.target.value)} className="w-auto" />
+          )}
+          {groupBy === "month" && (
+            <Input id="transaction-period" type="month" value={selectedMonth} onChange={event => setSelectedMonth(event.target.value)} className="w-auto" />
+          )}
+          {groupBy === "year" && (
+            <select
+              id="transaction-period"
+              value={selectedYear}
+              onChange={event => setSelectedYear(event.target.value)}
+              className="flex h-10 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+            >
+              <option value="">Semua tahun</option>
+              {availableYears.map(year => <option key={year} value={year}>{year}</option>)}
+            </select>
+          )}
+        </div>
+        {(selectedDay || selectedMonth || selectedYear) && (
+          <Button type="button" variant="outline" onClick={clearPeriod}>Tampilkan semua</Button>
+        )}
       </div>
 
       {filteredOffline.length > 0 && (

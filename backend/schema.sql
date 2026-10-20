@@ -89,6 +89,15 @@ CREATE TABLE IF NOT EXISTS transactions (
     INDEX ix_transactions_nfc_total (umkm_id, nfc_card_id, total)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS receipt_print_jobs (
+    transaction_id VARCHAR(64) NOT NULL PRIMARY KEY,
+    umkm_id VARCHAR(36) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    printed_at VARCHAR(40) NULL,
+    INDEX ix_receipt_print_jobs_umkm (umkm_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id VARCHAR(36) NOT NULL PRIMARY KEY,
     user_id VARCHAR(36) NULL,

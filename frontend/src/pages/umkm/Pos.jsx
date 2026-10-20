@@ -65,7 +65,6 @@ export default function Pos() {
     const deviceId = getDeviceId();
     const nonce = crypto.randomUUID();
     const createdAt = new Date().toISOString();
-    const signature = await signTransaction({ clientTxnId, total, deviceId, nonce });
 
     const payload = {
       client_txn_id: clientTxnId,
@@ -75,7 +74,7 @@ export default function Pos() {
       customer_id: customerId || null,
       nfc_card_id: nfcCardId || null,
       device_id: deviceId,
-      signature, nonce,
+      nonce,
       created_at_client: createdAt,
       offline: false,
     };
@@ -91,11 +90,20 @@ export default function Pos() {
     }
 
     try {
-      const { data } = await api.post("/umkm/transactions", payload);
+      const signature = await signTransaction({ clientTxnId, total, deviceId, nonce });
+      const { data } = await api.post("/umkm/transactions", { ...payload, signature });
       setReceipt(data.transaction);
       setCart([]);
       load();
-      toast.success("Pembayaran berhasil");
+      try {
+        const { data: printData } = await api.post(`/umkm/transactions/${encodeURIComponent(data.transaction.id)}/print`);
+        if (printData.customer_balance != null) {
+          setReceipt({ ...data.transaction, customer_balance: printData.customer_balance });
+        }
+      } catch (printError) {
+        const detail = printError.response?.data?.detail || "printer termal tidak tersedia.";
+        toast.error(`Transaksi berhasil, tetapi struk gagal dicetak: ${detail}`);
+      }
     } catch (err) {
       toast.error(err.response?.data?.detail || "Transaksi gagal");
       throw err;

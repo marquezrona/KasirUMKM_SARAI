@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
-import { api } from "@/lib/api";
+import { api, signTransaction } from "@/lib/api";
 import { listOfflineTxns, removeOfflineTxn } from "@/lib/db";
 import { toast } from "sonner";
 
@@ -23,12 +23,24 @@ export function OfflineProvider({ children }) {
     const queue = await listOfflineTxns();
     if (queue.length === 0) return;
     setSyncing(true);
-    let ok = 0;
     for (const t of queue) {
       try {
-        await api.post("/umkm/transactions", t);
+        const signature = await signTransaction({
+          clientTxnId: t.client_txn_id,
+          total: t.total,
+          deviceId: t.device_id,
+          nonce: t.nonce,
+        });
+        const { data } = await api.post("/umkm/transactions", { ...t, signature });
         await removeOfflineTxn(t.client_txn_id);
-        ok++;
+        if (data.transaction?.id) {
+          try {
+            await api.post(`/umkm/transactions/${encodeURIComponent(data.transaction.id)}/print`);
+          } catch (printError) {
+            const detail = printError.response?.data?.detail || "printer termal tidak tersedia.";
+            toast.error(`Transaksi berhasil disinkronkan, tetapi struk gagal dicetak: ${detail}`);
+          }
+        }
       } catch (e) {
         // if duplicate, remove locally
         if (e.response?.status === 409) {
@@ -38,7 +50,6 @@ export function OfflineProvider({ children }) {
     }
     setSyncing(false);
     await refreshPending();
-    if (ok > 0) toast.success(`✓ ${ok} transaksi berhasil disinkronkan`);
   }, [effectiveOnline, refreshPending]);
 
   useEffect(() => {

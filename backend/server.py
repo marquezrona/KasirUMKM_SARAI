@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy.exc import IntegrityError
 from database import Database
 from backup import run_daily_database_backups
+from printing import print_thermal_receipt
 
 # ------------------------------------------------------------
 # Setup
@@ -305,6 +306,13 @@ class TransactionIn(BaseModel):
     nonce: str
     created_at_client: str
     offline: bool = False
+
+
+class TransactionSignatureIn(BaseModel):
+    client_txn_id: str
+    total: float
+    device_id: str
+    nonce: str
 
 
 class SettlementConfigIn(BaseModel):
@@ -1066,7 +1074,7 @@ async def delete_product(pid: str, user=Depends(require_umkm)):
 
 @api.get("/umkm/customers")
 async def list_customers(user=Depends(require_umkm)):
-    cs = await db.customers.get_many({"umkm_id": user["umkm_id"]}, limit=1000)
+    cs = await db.customers.get_many({"umkm_id": user["umkm_id"]}, limit=10000)
     # add masked card
     for c in cs:
         if c.get("nfc_card_id"):
@@ -1077,6 +1085,16 @@ async def list_customers(user=Depends(require_umkm)):
 
 @api.post("/umkm/customers")
 async def create_customer(body: CustomerIn, user=Depends(require_umkm)):
+    if body.nfc_card_id:
+        existing = await db.customers.get_many(
+            {"nfc_card_id": body.nfc_card_id},
+            limit=2,
+        )
+        if existing:
+            raise HTTPException(
+                409,
+                "Kartu NFC sudah terdaftar. Pelanggan tersebut dapat langsung bertransaksi di UMKM mitra tanpa didaftarkan ulang.",
+            )
     c = {"id": str(uuid.uuid4()), "umkm_id": user["umkm_id"], **body.dict(), "created_at": now_iso()}
     await db.customers.insert(c)
     await audit(user["id"], "customer_create", {"customer_id": c["id"]}, user["umkm_id"])
@@ -1085,6 +1103,16 @@ async def create_customer(body: CustomerIn, user=Depends(require_umkm)):
 
 @api.put("/umkm/customers/{cid}")
 async def update_customer(cid: str, body: CustomerIn, user=Depends(require_umkm)):
+    if body.nfc_card_id:
+        matching_cards = await db.customers.get_many(
+            {"nfc_card_id": body.nfc_card_id},
+            limit=2,
+        )
+        if any(customer["id"] != cid for customer in matching_cards):
+            raise HTTPException(
+                409,
+                "Kartu NFC sudah terdaftar pada pelanggan lain.",
+            )
     updated = await db.customers.update({"id": cid, "umkm_id": user["umkm_id"]}, body.dict())
     if not updated:
         raise HTTPException(404, "Pelanggan tidak ditemukan")
@@ -1099,21 +1127,109 @@ async def delete_customer(cid: str, user=Depends(require_umkm)):
 
 @api.get("/umkm/customers/by-card/{card_id}")
 async def customer_by_card(card_id: str, user=Depends(require_umkm)):
-    c = await db.customers.get_one({"umkm_id": user["umkm_id"], "nfc_card_id": card_id})
-    if not c:
-        # global fallback for demo cards
-        c = await db.customers.get_one({"nfc_card_id": card_id})
-    if not c:
+    customers = await db.customers.get_many({"nfc_card_id": card_id}, limit=2)
+    if len(customers) > 1:
+        raise HTTPException(
+            409,
+            "ID kartu terdaftar pada beberapa pelanggan. Minta admin UMKM menyelesaikan duplikasi sebelum transaksi.",
+        )
+    if not customers:
         raise HTTPException(404, "Kartu tidak dikenal")
-    c["nfc_card_masked"] = "****" + card_id[-4:]
-    return c
+    c = customers[0]
+    return {
+        "id": c["id"],
+        "name": c["name"],
+        "balance": c["balance"],
+        "nfc_card_masked": "****" + card_id[-4:],
+    }
 
 
 @api.get("/umkm/transactions")
-async def list_transactions(limit: int = 200, user=Depends(require_umkm)):
+async def list_transactions(limit: int = 10000, user=Depends(require_umkm)):
     return await db.transactions.get_many(
         {"umkm_id": user["umkm_id"]}, order_by=("created_at", "desc"), limit=limit
     )
+
+
+@api.post("/umkm/transactions/signature")
+async def sign_transaction_request(body: TransactionSignatureIn, user=Depends(require_umkm)):
+    payload = f"{body.client_txn_id}|{body.total}|{body.device_id}|{body.nonce}"
+    return {"signature": sign_transaction(payload)}
+
+
+@api.post("/umkm/transactions/{transaction_id}/print")
+async def print_transaction_receipt(
+    transaction_id: str,
+    user=Depends(require_umkm),
+):
+    transaction = await db.transactions.get_one({
+        "id": transaction_id,
+        "umkm_id": user["umkm_id"],
+        "status": "PAID",
+    })
+    if not transaction:
+        raise HTTPException(404, "Transaksi berhasil tidak ditemukan untuk dicetak")
+    umkm = await db.umkms.get_one({"id": user["umkm_id"]})
+    if not umkm:
+        raise HTTPException(404, "Data UMKM tidak ditemukan")
+    if transaction["payment_method"] == "NFC" and transaction.get("customer_id"):
+        customer = await db.customers.get_one({
+            "id": transaction["customer_id"],
+        })
+        if not customer:
+            raise HTTPException(404, "Pelanggan transaksi tidak ditemukan")
+        transaction["customer_balance"] = customer["balance"]
+
+    print_claim = {
+        "transaction_id": transaction_id,
+        "umkm_id": user["umkm_id"],
+        "status": "PRINTING",
+        "created_at": now_iso(),
+        "printed_at": None,
+    }
+    try:
+        await db.receipt_print_jobs.insert(print_claim)
+    except IntegrityError:
+        existing_job = await db.receipt_print_jobs.get_one({"transaction_id": transaction_id})
+        if existing_job and existing_job["status"] == "FAILED":
+            deleted = await db.receipt_print_jobs.delete_one({
+                "transaction_id": transaction_id,
+                "status": "FAILED",
+            })
+            if deleted:
+                try:
+                    await db.receipt_print_jobs.insert(print_claim)
+                except IntegrityError:
+                    return {"ok": True, "already_printed": True}
+            else:
+                return {"ok": True, "already_printed": True}
+        else:
+            return {"ok": True, "already_printed": True}
+
+    try:
+        await asyncio.to_thread(
+            print_thermal_receipt,
+            transaction,
+            umkm["store_name"],
+            umkm.get("address") or "",
+            umkm.get("phone") or "",
+        )
+    except OSError as exc:
+        await db.receipt_print_jobs.update(
+            {"transaction_id": transaction_id},
+            {"status": "FAILED"},
+        )
+        log.exception("Thermal receipt printing failed for transaction %s", transaction_id)
+        raise HTTPException(503, f"Transaksi berhasil, tetapi struk gagal dicetak: {exc}") from exc
+    await db.receipt_print_jobs.update(
+        {"transaction_id": transaction_id},
+        {"status": "PRINTED", "printed_at": now_iso()},
+    )
+    return {
+        "ok": True,
+        "already_printed": False,
+        "customer_balance": transaction.get("customer_balance"),
+    }
 
 
 @api.post("/umkm/transactions")
@@ -1179,8 +1295,13 @@ async def create_transaction(body: TransactionIn, user=Depends(require_umkm)):
                 settlement_config = {"umkm_pct": 90, "pemkab_pct": 8, "admin_pct": 2}
             shares = calculate_settlement_shares(body.total, settlement_config)
 
-            if body.payment_method == "NFC" and body.nfc_card_id:
-                customer = await tx.customers.get_one({"nfc_card_id": body.nfc_card_id})
+            if body.payment_method == "NFC":
+                if not body.customer_id or not body.nfc_card_id:
+                    raise HTTPException(400, "Kartu NFC dan pelanggan harus dipilih")
+                customer = await tx.customers.get_one({
+                    "id": body.customer_id,
+                    "nfc_card_id": body.nfc_card_id,
+                })
                 if not customer:
                     raise HTTPException(400, "Kartu NFC tidak dikenal")
                 if customer.get("balance", 0) < body.total:
@@ -1459,8 +1580,11 @@ async def startup():
                 "image": None,
                 "created_at": now_iso(),
             })
-        # customers (per UMKM copies of demo cards for isolation, but also global lookup)
+        # Demo NFC cards are shared globally, so seed each card only once.
         for c in DEMO_CUSTOMERS:
+            existing_customer = await db.customers.get_one({"nfc_card_id": c["nfc_card_id"]})
+            if existing_customer:
+                continue
             await db.customers.insert({
                 "id": str(uuid.uuid4()),
                 "umkm_id": umkm_id,

@@ -10,6 +10,16 @@ import { toast } from "sonner";
 
 const rp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
 const empty = { name: "", phone: "", nfc_card_id: "", balance: 0 };
+const periodKey = (value, period) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  if (period === "year") return String(year);
+  if (period === "month") return `${year}-${month}`;
+  return `${year}-${month}-${day}`;
+};
 
 export default function Customers() {
   const [rows, setRows] = useState([]);
@@ -18,24 +28,29 @@ export default function Customers() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [groupBy, setGroupBy] = useState("day");
+  const [selectedDay, setSelectedDay] = useState("");
+  const [selectedMonth, setSelectedMonth] = useState("");
+  const [selectedYear, setSelectedYear] = useState("");
 
   const load = async () => { const { data } = await api.get("/umkm/customers"); setRows(data); };
   useEffect(() => { load(); }, []);
 
   const filteredRows = rows.filter(customer => {
     const value = query.trim().toLowerCase();
-    return !value || [customer.name, customer.phone, customer.nfc_card_id, customer.nfc_card_masked]
+    const matchesQuery = !value || [customer.name, customer.phone, customer.nfc_card_id, customer.nfc_card_masked]
       .some(field => String(field || "").toLowerCase().includes(value));
+    const selectedPeriod = groupBy === "day" ? selectedDay : groupBy === "month" ? selectedMonth : selectedYear;
+    return matchesQuery && (!selectedPeriod || periodKey(customer.created_at, groupBy) === selectedPeriod);
   });
+
+  const availableYears = useMemo(() => [...new Set(rows
+    .map(customer => periodKey(customer.created_at, "year"))
+    .filter(year => year !== "unknown"))].sort((a, b) => b.localeCompare(a)), [rows]);
 
   const groupedRows = useMemo(() => {
     const groups = new Map();
     filteredRows.forEach(customer => {
-      const date = new Date(customer.created_at);
-      const validDate = !Number.isNaN(date.getTime());
-      const key = !validDate ? "unknown" : groupBy === "day"
-        ? date.toISOString().slice(0, 10)
-        : groupBy === "month" ? date.toISOString().slice(0, 7) : date.toISOString().slice(0, 4);
+      const key = periodKey(customer.created_at, groupBy);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(customer);
     });
@@ -47,6 +62,12 @@ export default function Customers() {
       customers,
     }));
   }, [filteredRows, groupBy]);
+
+  const clearPeriod = () => {
+    setSelectedDay("");
+    setSelectedMonth("");
+    setSelectedYear("");
+  };
 
   const openNew = () => { setForm(empty); setEditing(null); setOpen(true); };
   const openEdit = (c) => { setForm({ name: c.name, phone: c.phone || "", nfc_card_id: c.nfc_card_id || "", balance: c.balance || 0 }); setEditing(c.id); setOpen(true); };
@@ -95,6 +116,9 @@ export default function Customers() {
           )}
         </>
       </div>
+      <p className="text-sm text-slate-600">
+        Pelanggan terdaftar dapat memakai kartu NFC dan saldo yang sama di semua UMKM mitra. Jika kartu sudah terdaftar di UMKM lain, pelanggan tidak perlu didaftarkan ulang.
+      </p>
 
       <div className="relative max-w-md">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -120,6 +144,33 @@ export default function Customers() {
           <button type="button" onClick={() => setGroupBy("month")} className={`rounded-md px-3 py-1.5 text-sm font-semibold ${groupBy === "month" ? "bg-[#0A3663] text-white" : "text-[#0C2340]"}`}>Per Bulan</button>
           <button type="button" onClick={() => setGroupBy("year")} className={`rounded-md px-3 py-1.5 text-sm font-semibold ${groupBy === "year" ? "bg-[#0A3663] text-white" : "text-[#0C2340]"}`}>Per Tahun</button>
         </div>
+      </div>
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="space-y-1">
+          <Label htmlFor="customer-period">
+            {groupBy === "day" ? "Pilih tanggal" : groupBy === "month" ? "Pilih bulan" : "Pilih tahun"}
+          </Label>
+          {groupBy === "day" && (
+            <Input id="customer-period" type="date" value={selectedDay} onChange={event => setSelectedDay(event.target.value)} className="w-auto" />
+          )}
+          {groupBy === "month" && (
+            <Input id="customer-period" type="month" value={selectedMonth} onChange={event => setSelectedMonth(event.target.value)} className="w-auto" />
+          )}
+          {groupBy === "year" && (
+            <select
+              id="customer-period"
+              value={selectedYear}
+              onChange={event => setSelectedYear(event.target.value)}
+              className="flex h-10 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+            >
+              <option value="">Semua tahun</option>
+              {availableYears.map(year => <option key={year} value={year}>{year}</option>)}
+            </select>
+          )}
+        </div>
+        {(selectedDay || selectedMonth || selectedYear) && (
+          <Button type="button" variant="outline" onClick={clearPeriod}>Tampilkan semua</Button>
+        )}
       </div>
 
       <Card className="border-[#E5DEC9] overflow-hidden">

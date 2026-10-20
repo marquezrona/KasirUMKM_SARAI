@@ -62,7 +62,7 @@ class MySQLDdlTests(unittest.TestCase):
             str(CreateTable(table).compile(dialect=mysql.dialect()))
             for table in metadata.sorted_tables
         ]
-        self.assertEqual(len(compiled), 10)
+        self.assertEqual(len(compiled), 11)
         self.assertTrue(all("CREATE TABLE" in statement for statement in compiled))
 
     def test_database_from_environment_falls_back_to_sqlite(self):

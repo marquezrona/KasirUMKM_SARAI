@@ -23,23 +23,14 @@ api.interceptors.response.use(
   }
 );
 
-// Demo HMAC secret matches backend HMAC_SECRET. In production this would be a
-// per-device key exchanged via secure channel — this is a prototype/demo only.
-const HMAC_SECRET_DEMO = "k4s1r-s4bu-r41ju4-hmac-2026-secret";
-
-async function hmacSHA256Hex(message, key) {
-  const enc = new TextEncoder();
-  const cryptoKey = await window.crypto.subtle.importKey(
-    "raw", enc.encode(key),
-    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
-  const sig = await window.crypto.subtle.sign("HMAC", cryptoKey, enc.encode(message));
-  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
 export async function signTransaction({ clientTxnId, total, deviceId, nonce }) {
-  const msg = `${clientTxnId}|${total}|${deviceId}|${nonce}`;
-  return await hmacSHA256Hex(msg, HMAC_SECRET_DEMO);
+  const { data } = await api.post("/umkm/transactions/signature", {
+    client_txn_id: clientTxnId,
+    total,
+    device_id: deviceId,
+    nonce,
+  });
+  return data.signature;
 }
 
 export function getDeviceId() {

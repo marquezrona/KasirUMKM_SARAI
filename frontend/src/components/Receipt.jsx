@@ -44,6 +44,12 @@ export default function Receipt({ txn, onNew }) {
             <span>TOTAL</span><span>{rp(txn.total)}</span>
           </div>
           <div className="flex justify-between mt-2"><span className="text-slate-500">Pembayaran</span><span className="font-semibold">{txn.payment_method}</span></div>
+          {txn.payment_method === "NFC" && txn.customer_balance != null && (
+            <div className="flex justify-between font-semibold">
+              <span className="text-slate-500">Sisa saldo pelanggan</span>
+              <span>{rp(txn.customer_balance)}</span>
+            </div>
+          )}
           <div className="flex justify-between"><span className="text-slate-500">Status</span>
             <span className={`font-semibold ${txn.sync_status === "SYNCED" ? "text-emerald-600" : "text-amber-600"}`}>
               {txn.sync_status === "SYNCED" ? "SYNCED" : "OFFLINE (menunggu sync)"}

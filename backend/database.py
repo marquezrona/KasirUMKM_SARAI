@@ -144,6 +144,17 @@ transactions = Table(
     Index("ix_transactions_nfc_total", "umkm_id", "nfc_card_id", "total"),
 )
 
+receipt_print_jobs = Table(
+    "receipt_print_jobs",
+    metadata,
+    Column("transaction_id", String(64), primary_key=True),
+    Column("umkm_id", String(36), nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("printed_at", String(40)),
+    Index("ix_receipt_print_jobs_umkm", "umkm_id", "created_at"),
+)
+
 audit_logs = Table(
     "audit_logs",
     metadata,
@@ -206,7 +217,7 @@ password_reset_requests = Table(
 
 TABLES = {
     table.name: table
-    for table in (users, umkms, umkm_payout_accounts, products, customers, transactions, audit_logs, settlement_config, settlement_allocations, password_reset_requests)
+    for table in (users, umkms, umkm_payout_accounts, products, customers, transactions, receipt_print_jobs, audit_logs, settlement_config, settlement_allocations, password_reset_requests)
 }
 
 
